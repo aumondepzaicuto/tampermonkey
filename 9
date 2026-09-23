@@ -1,0 +1,1113 @@
+// ==UserScript==
+// @name         DOM Vision Assistant - CYBER UI
+// @namespace    local.dom-vision-assistant
+// @version      2.0.1
+// @description  DOM Vision Assistant - Cyber Hacker UI
+// @match        https://docs.google.com/forms/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      openrouter.ai
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const STORAGE_KEY = 'dom-vision-assistant-settings-v2';
+    const MAX_ALL = 3;
+
+    const PROVIDERS = {
+        openrouter: {
+            name: 'OpenRouter',
+            base: 'https://openrouter.ai/api/v1',
+            models: [],
+            pick: id => id.endsWith(':free'),
+            hint: 'OpenRouter model :free',
+            // FIX 4: key mặc định để script chạy được dù UI ẩn
+            defaultKey: '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'
+        }
+    };
+
+    const store = {
+        get(key, fallback = '') {
+            try {
+                return typeof GM_getValue === 'function'
+                    ? GM_getValue(key, fallback)
+                    : (localStorage.getItem(key) ?? fallback);
+            } catch (_) { return fallback; }
+        },
+        set(key, value) {
+            try {
+                if (typeof GM_setValue === 'function') GM_setValue(key, value);
+                else localStorage.setItem(key, value);
+            } catch (_) {}
+        }
+    };
+
+    const getKey = provider =>
+        store.get(`dva-key-${provider}`, PROVIDERS[provider].defaultKey || '');
+
+    function loadSettings() {
+        try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); }
+        catch (_) { return {}; }
+    }
+
+    const settings = Object.assign({
+        provider: 'openrouter',
+        model: 'all',
+       prompt:
+    'Bạn là chuyên gia phân tích câu hỏi trắc nghiệm. ' +
+    'Đọc kỹ từng câu hỏi và toàn bộ đáp án, suy luận cẩn thận rồi chọn ra đáp án ĐÚNG nhất về mặt kiến thức. ' +
+    'Nếu không chắc chắn tuyệt đối, vẫn phải chọn phương án khả thi nhất — không bỏ trống, không từ chối bất kỳ câu nào. ' +
+    'Chỉ trả về DUY NHẤT một dòng JSON hợp lệ, đúng nguyên format sau, không sai một ký tự: ' +
+    '{"answers":[{"q":1,"choice":"A"},{"q":2,"choice":"C"}]} ' +
+    'Tuyệt đối KHÔNG giải thích, không chú thích, không bọc trong code block hay markdown nào khác, không xuống dòng thừa, không ký tự nào ngoài chuỗi JSON.',
+        autofill: true,
+        autosubmit: false
+    }, loadSettings());
+
+    delete settings.apiKey;
+    if (!PROVIDERS[settings.provider]) settings.provider = 'openrouter';
+
+    function saveSettings() {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    }
+
+    // ============================================================
+    // MODEL
+    // ============================================================
+    function fetchModels(cfg, key) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: `${cfg.base}/models`,
+                headers: key ? { Authorization: `Bearer ${key}` } : {},
+                timeout: 20000,
+                onload: response => {
+                    try {
+                        const data = JSON.parse(response.responseText);
+                        if (response.status < 200 || response.status >= 300) {
+                            throw new Error(`HTTP ${response.status}`);
+                        }
+                        const ids = (data.data || [])
+                            .map(model => String(model.id || '').replace(/^models\//, ''))
+                            .filter(cfg.pick);
+                        resolve([...new Set(ids)]);
+                    } catch (error) { reject(error); }
+                },
+                onerror: () => reject(new Error('Không tải được danh sách model')),
+                ontimeout: () => reject(new Error('Timeout khi tải danh sách model'))
+            });
+        });
+    }
+
+    async function listModels(cfg, key) {
+        if (!cfg.pick || (cfg.listNeedsKey && !key)) return cfg.models;
+        try {
+            return [...new Set([...cfg.models, ...await fetchModels(cfg, key)])];
+        } catch (_) { return cfg.models; }
+    }
+
+    // ============================================================
+    // GOOGLE FORMS DOM
+    // ============================================================
+    function collectFormQuestions() {
+        const items = [...document.querySelectorAll('[role="listitem"]')];
+        const questions = [];
+        items.forEach(item => {
+            const headingEl = item.querySelector('[role="heading"]');
+            if (!headingEl) return;
+            const heading = headingEl.textContent.replace(/\s+/g, ' ').trim();
+            const optionEls = [...item.querySelectorAll('[role="radio"], [role="checkbox"]')];
+            if (!optionEls.length) return;
+            const options = optionEls.map(el => {
+                const label = el.getAttribute('aria-label') || el.getAttribute('data-value') || el.textContent || '';
+                return { text: label.replace(/\s+/g, ' ').trim(), element: el };
+            }).filter(o => o.text);
+            if (!heading || !options.length) return;
+            questions.push({ index: questions.length + 1, heading, options });
+        });
+        return questions;
+    }
+
+    function renderQuestionsForPrompt(questions) {
+        return questions.map(q => {
+            const lines = q.options.map((o, i) => `   ${String.fromCharCode(65 + i)}. ${o.text}`);
+            return `${q.index}. ${q.heading}\n${lines.join('\n')}`;
+        }).join('\n\n');
+    }
+
+    // ============================================================
+    // PARSE AI
+    // ============================================================
+    function parseAnswers(rawText, questionCount) {
+        if (!rawText) return null;
+        let text = rawText.trim();
+        const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+        if (fence) text = fence[1].trim();
+        const start = text.indexOf('{');
+        const end = text.lastIndexOf('}');
+        if (start === -1 || end === -1 || end <= start) return null;
+        const candidate = text.slice(start, end + 1);
+        let parsed;
+        try { parsed = JSON.parse(candidate); }
+        catch (_) { return null; }
+        const arr = Array.isArray(parsed) ? parsed : parsed.answers;
+        if (!Array.isArray(arr)) return null;
+        const map = new Map();
+        arr.forEach(entry => {
+            const q = Number(entry.q ?? entry.question ?? entry.index);
+            let choice = entry.choice ?? entry.answer ?? entry.a ?? entry.letter;
+            if (typeof choice !== 'string' || !q) return;
+            choice = choice.trim().toUpperCase();
+            const letter = choice.match(/[A-Z]/);
+            if (!letter) return;
+            map.set(q, letter[0]);
+        });
+        let valid = 0;
+        map.forEach((_, q) => { if (q >= 1 && q <= questionCount) valid++; });
+        return valid ? map : null;
+    }
+
+    // ============================================================
+    // CLICK OPTION
+    // ============================================================
+    function clickOption(optionEl) {
+        if (!optionEl) return false;
+        const label = optionEl.closest('label');
+        try {
+            if (label) { label.click(); return true; }
+            optionEl.click();
+            return true;
+        } catch (_) { return false; }
+    }
+
+    function applyAnswers(questions, answerMap) {
+        const applied = [];
+        const failed = [];
+        questions.forEach(q => {
+            const letter = answerMap.get(q.index);
+            if (!letter) { failed.push(q.index); return; }
+            const idx = letter.charCodeAt(0) - 65;
+            const option = q.options[idx];
+            if (!option) { failed.push(q.index); return; }
+            if (option.element.getAttribute('aria-checked') === 'true') {
+                applied.push({ q: q.index, letter, text: option.text, skipped: true });
+                return;
+            }
+            if (clickOption(option.element)) {
+                applied.push({ q: q.index, letter, text: option.text });
+            } else {
+                failed.push(q.index);
+            }
+        });
+        return { applied, failed };
+    }
+
+    // ============================================================
+    // ERROR
+    // ============================================================
+    function explainError(status, data, raw, cfg) {
+        const err = (Array.isArray(data) ? data[0] : data) || {};
+        const detail = (
+            err.error?.message ||
+            err.message ||
+            (typeof err.error === 'string' ? err.error : '') ||
+            String(raw || '').slice(0, 160)
+        ).trim();
+        if (/free tier/i.test(detail)) return 'OpenRouter chặn model free (rate limit). Đổi model hoặc thử lại sau.';
+        if (status === 401 || status === 403) return `${cfg.name} từ chối API key (HTTP ${status}). ${detail}`.trim();
+        if (status === 402 || /balance|credit|billing|payment/i.test(detail)) return `Tài khoản chưa có credit/billing. ${detail}`;
+        if (status === 404) return `Model không tồn tại hoặc không được bật cho key này. ${detail}`;
+        if (status === 429) return `Hết hạn mức hoặc gọi quá nhanh (HTTP 429), thử lại sau. ${detail}`;
+        return `HTTP ${status}${detail ? `: ${detail}` : ''}`;
+    }
+
+    // ============================================================
+    // AI REQUEST
+    // ============================================================
+    function requestAI(domText, prompt, model, control, cfg, apiKey) {
+        return new Promise((resolve, reject) => {
+            const content = `${prompt}\n\n---\nDANH SÁCH CÂU HỎI:\n${domText}`;
+            control.request = GM_xmlhttpRequest({
+                method: 'POST',
+                url: `${cfg.base}/chat/completions`,
+                headers: {
+                    Authorization: `Bearer ${apiKey}`,
+                    'Content-Type': 'application/json',
+                    'HTTP-Referer': location.origin,
+                    'X-Title': 'DOM Vision Assistant'
+                },
+                data: JSON.stringify({
+                    model,
+                    messages: [{ role: 'user', content }],
+                    temperature: 0.1,
+                    max_tokens: 4096
+                }),
+                timeout: 90000,
+                onload: response => {
+                    let data = null;
+                    try { data = JSON.parse(response.responseText); } catch (_) {}
+                    if (response.status < 200 || response.status >= 300 || data?.error) {
+                        reject(new Error(explainError(response.status, data, response.responseText, cfg)));
+                        return;
+                    }
+                    const message = data?.choices?.[0]?.message;
+                    let text = message?.content;
+                    if (Array.isArray(text)) text = text.map(part => part?.text || '').join('');
+                    text = String(text || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+                    if (!text) { reject(new Error('Model không trả về nội dung')); return; }
+                    resolve(text);
+                },
+                onabort: () => reject(new Error('Đã dừng request')),
+                onerror: () => reject(new Error(`Không kết nối được ${new URL(cfg.base).host}`)),
+                ontimeout: () => reject(new Error('Timeout (90s)'))
+            });
+        });
+    }
+
+    // ============================================================
+    // AUTO SUBMIT
+    // ============================================================
+    function findSubmitButton() {
+        const exact = [...document.querySelectorAll('[role="button"]')].find(el => {
+            const label = el.getAttribute('aria-label') || '';
+            return label.trim() === 'Gửi' || label.trim() === 'Gửi';
+        });
+        if (exact) return exact;
+
+        const buttons = [...document.querySelectorAll('[role="button"]')];
+        return buttons.find(el => {
+            const text = el.textContent.replace(/\s+/g, ' ').trim().toLowerCase();
+            return text === 'gửi' || text === 'gửi';
+        }) || null;
+    }
+
+    async function autoSubmitForm(status, control) {
+        if (control.stopped) return false;
+        status.textContent = 'Đang tìm nút Gửi...';
+        await new Promise(resolve => setTimeout(resolve, 700));
+        if (control.stopped) return false;
+        const submitButton = findSubmitButton();
+        if (!submitButton) {
+            status.textContent = 'Không tìm thấy nút Gửi.';
+            return false;
+        }
+        submitButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await new Promise(resolve => setTimeout(resolve, 500));
+        if (control.stopped) return false;
+        status.textContent = 'Đang tự động nộp bài...';
+        try {
+            submitButton.click();
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            status.textContent = 'Đã gửi biểu mẫu.';
+            return true;
+        } catch (error) {
+            status.textContent = `Không thể nộp: ${error.message}`;
+            return false;
+        }
+    }
+
+    // ============================================================
+    // CYBER UI
+    // ============================================================
+    GM_addStyle(`
+#dva-panel {
+    position: fixed;
+    left: 25px;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 2147483647;
+    width: 330px;
+    min-width: 300px;
+    max-width: 80vw;
+    min-height: 180px;
+    max-height: 80vh;
+    overflow: hidden;
+    color: #b8ffc9;
+    background: linear-gradient(145deg, rgba(2,15,8,.98), rgba(0,5,3,.99));
+    border: 1px solid rgba(0,255,100,.55);
+    border-radius: 14px;
+    box-shadow:
+        0 0 10px rgba(0,255,100,.35),
+        0 0 35px rgba(0,255,100,.18),
+        inset 0 0 30px rgba(0,255,100,.04);
+    font: 13px Consolas, "Courier New", monospace;
+    resize: both;
+    backdrop-filter: blur(12px);
+    transition: box-shadow .25s ease, border-color .25s ease;
+}
+
+#dva-panel::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(
+        0deg,
+        rgba(0,255,100,.025) 0px,
+        rgba(0,255,100,.025) 1px,
+        transparent 1px,
+        transparent 4px
+    );
+    z-index: 30;
+}
+
+#dva-panel::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: -40%;
+    height: 30%;
+    pointer-events: none;
+    background: linear-gradient(transparent, rgba(0,255,100,.09), transparent);
+    animation: dvaScan 5s linear infinite;
+    z-index: 31;
+}
+
+@keyframes dvaScan {
+    0% { top: -40%; }
+    100% { top: 120%; }
+}
+
+#dva-head {
+    position: relative;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 11px 13px;
+    border-bottom: 1px solid rgba(0,255,100,.3);
+    background: linear-gradient(90deg, rgba(0,255,100,.09), transparent, rgba(0,255,100,.04));
+    font-weight: 700;
+    cursor: move;
+    user-select: none;
+}
+
+#dva-title {
+    color: #5dff8d;
+    letter-spacing: 2px;
+    text-shadow: 0 0 6px rgba(0,255,100,.8), 0 0 16px rgba(0,255,100,.35);
+}
+
+#dva-head-actions { display: flex; gap: 5px; }
+
+#dva-head-actions button {
+    width: 25px;
+    height: 23px;
+    cursor: pointer;
+    color: #65ff91;
+    background: rgba(0,45,20,.85);
+    border: 1px solid rgba(0,255,100,.35);
+    border-radius: 5px;
+    font-family: monospace;
+    transition: .2s ease;
+}
+
+#dva-head-actions button:hover {
+    color: #001b08;
+    background: #54ff86;
+    box-shadow: 0 0 10px rgba(0,255,100,.8);
+}
+
+#dva-body {
+    position: relative;
+    display: grid;
+    gap: 10px;
+    padding: 13px;
+}
+
+#dva-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 7px;
+}
+
+#dva-actions button {
+    position: relative;
+    overflow: hidden;
+    cursor: pointer;
+    color: #66ff91;
+    background: linear-gradient(135deg, rgba(0,70,30,.85), rgba(0,25,12,.95));
+    border: 1px solid rgba(0,255,100,.4);
+    border-radius: 7px;
+    padding: 9px 7px;
+    font: bold 12px Consolas, monospace;
+    transition: .2s ease;
+}
+
+#dva-actions button:hover {
+    color: #001b08;
+    background: #4dff82;
+    box-shadow: 0 0 14px rgba(0,255,100,.65);
+    transform: translateY(-1px);
+}
+
+#dva-stop {
+    color: #ffe477 !important;
+    background: linear-gradient(135deg, rgba(55,40,0,.85), rgba(25,15,0,.95)) !important;
+    border-color: rgba(255,210,60,.4) !important;
+}
+
+#dva-copy {
+    color: #67ddff !important;
+    background: linear-gradient(135deg, rgba(0,45,70,.85), rgba(0,15,30,.95)) !important;
+    border-color: rgba(0,210,255,.4) !important;
+}
+
+#dva-options { display: grid; gap: 6px; }
+
+.dva-check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 9px;
+    color: #86bf96;
+    background: rgba(0,255,100,.025);
+    border: 1px solid rgba(0,255,100,.18);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: .2s ease;
+}
+
+.dva-check:hover {
+    color: #b0ffc2;
+    border-color: rgba(0,255,100,.5);
+    background: rgba(0,255,100,.06);
+}
+
+#dva-progress {
+    width: 100%;
+    height: 6px;
+    appearance: none;
+    border: 0;
+    background: #06150b;
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+#dva-progress::-webkit-progress-bar { background: #06150b; }
+
+#dva-progress::-webkit-progress-value {
+    background: linear-gradient(90deg, #078f3b, #42ff7d, #b2ffc5);
+    box-shadow: 0 0 9px rgba(0,255,100,.8);
+}
+
+#dva-status {
+    min-height: 18px;
+    color: #61ff8e;
+    padding: 5px 8px;
+    border-left: 2px solid #32ff70;
+    background: rgba(0,255,100,.025);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#dva-result {
+    white-space: pre-wrap;
+    max-height: 150px;
+    overflow: auto;
+    padding: 9px;
+    border: 1px solid rgba(0,255,100,.18);
+    border-radius: 6px;
+    background: rgba(0,10,5,.75);
+    color: #a8ffbc;
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+#dva-hidden-settings { display: none !important; }
+
+/* FIX 5: ẩn logo + percent khi panel đang expanded */
+#dva-panel:not(.dva-collapsed) #dva-logo,
+#dva-panel:not(.dva-collapsed) #dva-percent {
+    display: none;
+}
+
+#dva-panel.dva-collapsed {
+    position: fixed;
+    width: 32px;
+    height: 40px;
+    min-width: 32px;
+    min-height: 40px;
+    max-width: 32px;
+    max-height: 40px;
+    overflow: visible;
+    resize: none;
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+    border-radius: 0;
+    transform: none;
+    cursor: grab;
+    backdrop-filter: none;
+}
+
+#dva-panel.dva-collapsed:active { cursor: grabbing; }
+
+#dva-panel.dva-collapsed #dva-head {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: grab;
+    z-index: 50;
+}
+
+#dva-panel.dva-collapsed #dva-title { display: none; }
+#dva-panel.dva-collapsed #dva-head-actions { display: none; }
+#dva-panel.dva-collapsed #dva-body { display: none; }
+
+#dva-panel.dva-collapsed #dva-logo {
+    display: flex;
+    position: absolute;
+    left: 2px;
+    top: 2px;
+    width: 28px;
+    height: 28px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    color: #7dff9d;
+    background: radial-gradient(
+        circle at center,
+        rgba(0,255,100,.20) 0%,
+        rgba(0,40,15,.95) 42%,
+        rgba(0,5,2,1) 70%
+    );
+    border: 2px solid rgba(0,255,100,.9);
+    box-shadow:
+        0 0 7px rgba(0,255,100,.8),
+        0 0 20px rgba(0,255,100,.45),
+        inset 0 0 18px rgba(0,255,100,.35);
+    overflow: hidden;
+    z-index: 60;
+    animation: aumonhubPulse 2s infinite;
+}
+
+#dva-panel.dva-collapsed #dva-logo::before {
+    content: "";
+    position: absolute;
+    inset: 4px;
+    border-radius: 50%;
+    border: 2px dashed rgba(72,255,130,.75);
+    animation: aumonhubSpin 5s linear infinite;
+}
+
+#dva-panel.dva-collapsed #dva-logo::after {
+    content: "";
+    position: absolute;
+    width: 15px;
+    height: 15px;
+    border-radius: 50%;
+    border: 1px solid rgba(120,255,150,.8);
+    box-shadow: 0 0 10px rgba(0,255,100,.5);
+    animation: aumonhubInner 2.5s ease-in-out infinite;
+}
+
+#dva-panel.dva-collapsed #dva-logo-text {
+    position: relative;
+    z-index: 100;
+    display: block;
+    width: 26px;
+    text-align: center;
+    color: #a8ffbc;
+    font: 700 4px Arial, sans-serif;
+    letter-spacing: 1.3px;
+    line-height: 1.15;
+    text-shadow: 0 0 5px #00ff66, 0 0 12px rgba(0,255,100,.8);
+    animation: aumonhubText 2s infinite;
+}
+
+#dva-panel.dva-collapsed #dva-percent {
+    position: absolute;
+    left: 0;
+    top: 32px;
+    width: 32px;
+    text-align: center;
+    color: #67ddff;
+    font: bold 6px Consolas, monospace;
+    letter-spacing: 1px;
+    text-shadow:
+        0 0 2px #001018,
+        0 1px 2px #000,
+        0 0 10px rgba(103,221,255,.85),
+        0 0 22px rgba(103,221,255,.45);
+    z-index: 100;
+    pointer-events: none;
+}
+@keyframes aumonhubSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+@keyframes aumonhubInner {
+    0%,100% { transform: scale(.85); opacity: .45; }
+    50% { transform: scale(1.08); opacity: 1; }
+}
+
+@keyframes aumonhubPulse {
+    0%,100% {
+        box-shadow:
+            0 0 7px rgba(0,255,100,.8),
+            0 0 20px rgba(0,255,100,.4),
+            inset 0 0 18px rgba(0,255,100,.3);
+    }
+    50% {
+        box-shadow:
+            0 0 12px rgba(0,255,100,1),
+            0 0 35px rgba(0,255,100,.65),
+            inset 0 0 25px rgba(0,255,100,.45);
+    }
+}
+
+@keyframes aumonhubText {
+    0%,100% { opacity: .75; }
+    50% { opacity: 1; }
+}
+`);
+
+    // ========================================================
+    // PANEL
+    // ========================================================
+    const panel = document.createElement('section');
+    panel.id = 'dva-panel';
+
+    const make = (tag, props = {}, text = '') => {
+        const element = document.createElement(tag);
+        Object.entries(props).forEach(([key, value]) => {
+            if (key === 'className') element.className = value;
+            else if (key === 'textContent') element.textContent = value;
+            else element.setAttribute(key, value);
+        });
+        if (text) element.textContent = text;
+        return element;
+    };
+
+    // HEADER
+    const header = make('header', { id: 'dva-head' });
+    const title = make('span', { id: 'dva-title' }, 'ÂU_MON_HUB');
+
+    const logo = make('div', { id: 'dva-logo' });
+    const logoText = make('span', { id: 'dva-logo-text' }, 'AUMONHUB');
+    logo.appendChild(logoText);
+
+    // FIX 1: chỉ khai báo percent MỘT lần duy nhất ở đây
+    const percent = make('div', { id: 'dva-percent' }, '0%');
+
+    const headActions = make('div', { id: 'dva-head-actions' });
+    headActions.append(
+        make('button', { id: 'dva-smaller', title: 'Thu nhỏ' }, '−'),
+        make('button', { id: 'dva-larger', title: 'Phóng to' }, '+'),
+        make('button', { id: 'dva-close', title: 'Thu về nút tròn' }, '×')
+    );
+
+    header.append(title, logo, headActions);
+
+    // BODY
+    const body = make('div', { id: 'dva-body' });
+
+    // Hidden configuration
+    const hiddenSettings = make('div', { id: 'dva-hidden-settings' });
+
+    const providerInput = make('select', { id: 'dva-provider' });
+    Object.entries(PROVIDERS).forEach(([id, cfg]) => {
+        providerInput.appendChild(make('option', { value: id }, cfg.name));
+    });
+
+    const keyInput = make('input', { id: 'dva-key', type: 'text' });
+
+    const modelInput = make('select', { id: 'dva-model' });
+    modelInput.appendChild(make('option', { value: 'all' }, 'Đối chiếu nhiều model'));
+
+    const promptInput = make('textarea', { id: 'dva-prompt' });
+
+    hiddenSettings.append(providerInput, keyInput, modelInput, promptInput);
+
+    // ACTIONS
+    const actions = make('div', { id: 'dva-actions' });
+    const startButton = make('button', { id: 'dva-start' }, '▶ BẮT ĐẦU');
+    const stopButton = make('button', { id: 'dva-stop' }, '■ DỪNG');
+    const copyButton = make('button', { id: 'dva-copy' }, '⧉ COPY');
+    actions.append(startButton, stopButton, copyButton);
+
+    // OPTIONS
+    const options = make('div', { id: 'dva-options' });
+
+    const autoFillLabel = make('label', { className: 'dva-check' });
+    const autofillInput = make('input', { id: 'dva-autofill', type: 'checkbox' });
+    autofillInput.checked = settings.autofill !== false;
+    const autoFillText = make('span', {}, 'AUTO KẾT QUẢ');
+    autoFillLabel.append(autofillInput, autoFillText);
+
+    const autoSubmitLabel = make('label', { className: 'dva-check dva-check-submit' });
+    const autosubmitInput = make('input', { id: 'dva-autosubmit', type: 'checkbox' });
+    autosubmitInput.checked = settings.autosubmit === true;
+    const autoSubmitText = make('span', {}, 'AUTO NỘP');
+    autoSubmitLabel.append(autosubmitInput, autoSubmitText);
+
+    options.append(autoFillLabel, autoSubmitLabel);
+
+    // PROGRESS / STATUS / RESULT
+    const progress = make('progress', { id: 'dva-progress', max: '100', value: '0' });
+
+    // FIX 1 (tiếp): KHÔNG khai báo lại percent ở đây.
+    // setProgress dùng trực tiếp biến percent khai báo phía trên.
+    function setProgress(value) {
+        value = Math.max(0, Math.min(100, Math.round(value)));
+        progress.value = value;
+        percent.textContent = `${value}%`;
+    }
+
+    const status = make('div', { id: 'dva-status' }, 'SYSTEM READY // Chờ lệnh...');
+    const result = make('div', { id: 'dva-result' }, 'Kết quả AI sẽ xuất hiện ở đây.');
+
+    body.append(hiddenSettings, actions, options, progress, status, result);
+
+    panel.append(header, body, percent);
+    document.body.appendChild(panel);
+
+    // ========================================================
+    // REFERENCES
+    // ========================================================
+    const hasOption = value => [...modelInput.options].some(option => option.value === value);
+
+    const fillModels = list => {
+        modelInput.replaceChildren(
+            make('option', { value: 'all' }, `Đối chiếu ${Math.min(MAX_ALL, list.length)} model đầu`),
+            ...list.map(id => make('option', { value: id }, id))
+        );
+    };
+
+    const loadProvider = async preferredModel => {
+        const id = providerInput.value;
+        const cfg = PROVIDERS[id];
+        fillModels(cfg.models);
+        modelInput.value = hasOption(preferredModel) ? preferredModel : 'all';
+        const list = await listModels(cfg, keyInput.value.trim());
+        if (providerInput.value !== id) return;
+        const current = modelInput.value;
+        fillModels(list);
+        modelInput.value = hasOption(current) ? current : 'all';
+    };
+
+    // LOAD OLD SETTINGS
+    providerInput.value = settings.provider;
+    keyInput.value = getKey(settings.provider);
+    promptInput.value = settings.prompt;
+    loadProvider(settings.model);
+
+    // SETTINGS EVENTS
+    providerInput.onchange = () => {
+        settings.provider = providerInput.value;
+        settings.model = 'all';
+        saveSettings();
+        keyInput.value = getKey(providerInput.value);
+        loadProvider('all');
+    };
+
+    keyInput.onchange = () => {
+        store.set(`dva-key-${providerInput.value}`, keyInput.value.trim());
+        loadProvider(modelInput.value);
+    };
+
+    promptInput.onchange = () => {
+        settings.prompt = promptInput.value.trim();
+        saveSettings();
+    };
+
+    modelInput.onchange = () => {
+        settings.model = modelInput.value;
+        saveSettings();
+    };
+
+    autofillInput.onchange = () => {
+        settings.autofill = autofillInput.checked;
+        saveSettings();
+    };
+
+    autosubmitInput.onchange = () => {
+        settings.autosubmit = autosubmitInput.checked;
+        saveSettings();
+    };
+
+    // ========================================================
+    // COLLAPSE / EXPAND
+    // ========================================================
+    let collapseTimer;
+    let activeControl = null;
+    // FIX 3: cờ phân biệt click thật vs kéo
+    let didDrag = false;
+
+    const collapse = () => {
+        panel.classList.add('dva-collapsed');
+        panel.style.transform = 'none';
+        clearTimeout(collapseTimer);
+    };
+
+    const expand = () => {
+        panel.classList.remove('dva-collapsed');
+        // giữ vị trí ổn định sau khi expand (tránh nhảy do CSS translateY)
+        panel.style.transform = 'none';
+        clearTimeout(collapseTimer);
+        collapseTimer = setTimeout(collapse, 15000);
+    };
+
+    const resetCollapseTimer = () => {
+        if (!panel.classList.contains('dva-collapsed')) {
+            clearTimeout(collapseTimer);
+            collapseTimer = setTimeout(collapse, 15000);
+        }
+    };
+
+    panel.classList.add('dva-collapsed');
+
+    // FIX 3: dùng cờ didDrag thay vì so sánh tọa độ sai
+    panel.addEventListener('click', event => {
+        if (!panel.classList.contains('dva-collapsed')) return;
+        if (event.target.closest('button')) return;
+        if (didDrag) { didDrag = false; return; }
+        expand();
+    });
+
+    panel.addEventListener('pointerdown', resetCollapseTimer);
+    panel.addEventListener('input', resetCollapseTimer);
+
+    panel.querySelector('#dva-close').onclick = event => {
+        event.stopPropagation();
+        collapse();
+    };
+
+    panel.querySelector('#dva-smaller').onclick = event => {
+        event.stopPropagation();
+        panel.style.width = `${Math.max(300, panel.offsetWidth - 40)}px`;
+        panel.style.height = `${Math.max(180, panel.offsetHeight - 30)}px`;
+        resetCollapseTimer();
+    };
+
+    panel.querySelector('#dva-larger').onclick = event => {
+        event.stopPropagation();
+        panel.style.width = `${Math.min(Math.round(window.innerWidth * .8), panel.offsetWidth + 40)}px`;
+        panel.style.height = `${Math.min(Math.round(window.innerHeight * .8), panel.offsetHeight + 30)}px`;
+        resetCollapseTimer();
+    };
+
+    // ========================================================
+    // DRAG
+    // ========================================================
+    let dragging = false;
+    let dragOffsetX = 0;
+    let dragOffsetY = 0;
+
+    const dragTarget = panel.querySelector('#dva-head');
+
+    dragTarget.addEventListener('pointerdown', event => {
+        if (event.target.closest('button')) return;
+
+        const rect = panel.getBoundingClientRect();
+
+        panel.style.transform = 'none';
+        panel.style.left = `${rect.left}px`;
+        panel.style.top = `${rect.top}px`;
+
+        dragOffsetX = event.clientX - rect.left;
+        dragOffsetY = event.clientY - rect.top;
+
+        dragging = true;
+        didDrag = false; // reset cờ, chỉ set true khi move thực sự
+        panel.setPointerCapture(event.pointerId);
+        event.preventDefault();
+    });
+
+    panel.addEventListener('pointermove', event => {
+        if (!dragging) return;
+
+        // FIX 3: đánh dấu đã kéo nếu di chuyển quá ngưỡng
+        if (!didDrag) {
+            const dx = Math.abs(event.movementX || 0);
+            const dy = Math.abs(event.movementY || 0);
+            if (dx + dy > 0) didDrag = true;
+        }
+
+        const width = panel.classList.contains('dva-collapsed') ? 32 : panel.offsetWidth;
+        const height = panel.classList.contains('dva-collapsed') ? 40 : panel.offsetHeight;
+
+        const maxX = window.innerWidth - width;
+        const maxY = window.innerHeight - height;
+
+        const newX = Math.min(maxX, Math.max(0, event.clientX - dragOffsetX));
+        const newY = Math.min(maxY, Math.max(0, event.clientY - dragOffsetY));
+
+        panel.style.left = `${newX}px`;
+        panel.style.top = `${newY}px`;
+
+        event.preventDefault();
+    });
+
+    panel.addEventListener('pointerup', event => {
+        dragging = false;
+        try { panel.releasePointerCapture(event.pointerId); } catch (_) {}
+        resetCollapseTimer();
+    });
+
+    panel.addEventListener('pointercancel', () => {
+        dragging = false;
+    });
+
+    // ========================================================
+    // STOP
+    // ========================================================
+    stopButton.onclick = event => {
+        event.stopPropagation();
+        if (!activeControl) return;
+        activeControl.stopped = true;
+        if (activeControl.request) activeControl.request.abort();
+        status.textContent = 'SYSTEM STOPPED // Đã dừng.';
+        status.classList.remove('dva-error');
+        startButton.disabled = false;
+        stopButton.disabled = true;
+    };
+
+    // ========================================================
+    // START
+    // ========================================================
+    startButton.onclick = async event => {
+        event.stopPropagation();
+
+        const cfg = PROVIDERS[providerInput.value];
+        const apiKey = keyInput.value.trim();
+
+        settings.provider = providerInput.value;
+        settings.model = modelInput.value;
+        settings.prompt = promptInput.value.trim();
+        settings.autofill = autofillInput.checked;
+        settings.autosubmit = autosubmitInput.checked;
+        saveSettings();
+
+        const control = { stopped: false, request: null };
+        activeControl = control;
+
+        startButton.disabled = true;
+        stopButton.disabled = false;
+
+        // FIX 2: dùng setProgress để sync cả thanh và % text
+        setProgress(5);
+        status.classList.remove('dva-error');
+        status.textContent = 'SCANNING DOM // Đang đọc Google Forms...';
+        result.textContent = '';
+
+        try {
+            if (!apiKey) throw new Error(`Chưa có API key. ${cfg.hint}`);
+            store.set(`dva-key-${providerInput.value}`, apiKey);
+
+            const questions = collectFormQuestions();
+            if (!questions.length) throw new Error('Không tìm thấy câu hỏi/lựa chọn trong DOM.');
+
+            const domText = renderQuestionsForPrompt(questions);
+            setProgress(35);
+            if (control.stopped) return;
+
+            let models = [settings.model];
+            if (settings.model === 'all') {
+                status.textContent = 'MODEL SCAN // Đang tải model...';
+                models = (await listModels(cfg, apiKey)).slice(0, MAX_ALL);
+                if (!models.length) throw new Error('Chưa có model nào để gửi.');
+            }
+
+            const outputs = [];
+            let applied = null;
+
+            for (let index = 0; index < models.length; index += 1) {
+                if (control.stopped) return;
+                const model = models[index];
+
+                status.textContent = `AI LINK // ${index + 1}/${models.length} // ${model}`;
+                setProgress(55 + Math.round((index / models.length) * 40));
+
+                try {
+                    const answer = await requestAI(
+                        domText,
+                        settings.prompt || 'Phân tích các câu hỏi và đưa ra đáp án gợi ý để tôi tự kiểm tra.',
+                        model,
+                        control,
+                        cfg,
+                        apiKey
+                    );
+
+                    outputs.push(`[${model}]\n${answer}`);
+
+                    if (autofillInput.checked && !applied) {
+                        const map = parseAnswers(answer, questions.length);
+                        if (map) applied = applyAnswers(questions, map);
+                    }
+                } catch (error) {
+                    if (control.stopped) return;
+                    outputs.push(`[${model}] LỖI: ${error.message}`);
+                }
+
+                result.textContent = outputs.join('\n\n');
+            }
+
+            result.textContent = outputs.join('\n\n');
+
+            if (!control.stopped) {
+                setProgress(100);
+                let statusMsg = `AI COMPLETE // ${models.length} model`;
+
+                if (applied) {
+                    statusMsg += ` // Auto ${applied.applied.length}/${questions.length}`;
+                    if (applied.failed.length) {
+                        statusMsg += ` // Fail: ${applied.failed.join(', ')}`;
+                    }
+                } else if (autofillInput.checked) {
+                    statusMsg += ' // Không parse được JSON';
+                }
+
+                status.textContent = statusMsg;
+
+                // AUTO SUBMIT
+                if (
+                    autosubmitInput.checked &&
+                    applied &&
+                    applied.applied.length > 0 &&
+                    applied.failed.length === 0
+                ) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    if (!control.stopped) {
+                        await autoSubmitForm(status, control);
+                    }
+                }
+            }
+        } catch (error) {
+            if (!control.stopped) {
+                status.textContent = `SYSTEM ERROR // ${error.message}`;
+                status.classList.add('dva-error');
+            }
+            result.textContent = '';
+        } finally {
+            if (control.stopped) setProgress(0);
+            startButton.disabled = false;
+            stopButton.disabled = true;
+            activeControl = null;
+        }
+    };
+
+    // ========================================================
+    // COPY
+    // ========================================================
+    copyButton.onclick = async () => {
+        if (!result.textContent || result.textContent === 'Kết quả AI sẽ xuất hiện ở đây.') return;
+        try {
+            await navigator.clipboard.writeText(result.textContent);
+            status.textContent = 'CLIPBOARD // Đã copy kết quả.';
+        } catch (_) {
+            status.textContent = 'Không thể copy tự động.';
+        }
+    };
+
+    stopButton.disabled = true;
+})();
