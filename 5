@@ -1,0 +1,726 @@
+// ==UserScript==
+// @name         DOCX Reader v11 - Doc & Tim Kiem Dap An (Frame/VML support)
+// @namespace    http://tampermonkey.net/
+// @version      11.0
+// @description  Chon file .docx, doc noi dung, tim kiem cau hoi, nhan dien dap an (boi vang/gach chan/in dam/dai mau VML), ho tro hinh anh minh hoa va file kieu PDF-converted (framePr + v:shape). Mo ket qua tab moi.
+// @author       v11-stable
+// @match        *://*/*
+// @grant        none
+// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
+// ==/UserScript==
+
+(function () {
+'use strict';
+
+/* ============================================================
+   STATE
+============================================================ */
+let questions = [];
+let panelVis  = true;
+let selFile   = null;
+let minimized = false;
+
+/* ============================================================
+   SYMBOL MAP (Symbol / Wingdings)
+============================================================ */
+const SYM_MAP = {
+  0xF020:' ',0xF021:'!',0xF022:'\u2200',0xF024:'\u2203',0xF027:'\u220D',
+  0xF028:'(',0xF029:')',0xF02A:'\u2217',0xF02B:'+',0xF02C:',',0xF02D:'\u2212',
+  0xF02E:'.',0xF02F:'/',0xF030:'0',0xF031:'1',0xF032:'2',0xF033:'3',
+  0xF034:'4',0xF035:'5',0xF036:'6',0xF037:'7',0xF038:'8',0xF039:'9',
+  0xF03A:':',0xF03B:';',0xF03C:'<',0xF03D:'=',0xF03E:'>',0xF03F:'?',
+  0xF040:'\u2245',0xF044:'\u0394',0xF046:'\u03A6',0xF047:'\u0393',0xF050:'\u03A0',
+  0xF051:'\u0398',0xF053:'\u03A3',0xF057:'\u03A9',0xF061:'\u03B1',0xF062:'\u03B2',
+  0xF063:'\u03C7',0xF064:'\u03B4',0xF065:'\u03B5',0xF066:'\u03C6',0xF067:'\u03B3',
+  0xF068:'\u03B7',0xF06C:'\u03BB',0xF06D:'\u03BC',0xF06E:'\u03BD',0xF070:'\u03C0',
+  0xF071:'\u03B8',0xF072:'\u03C1',0xF073:'\u03C3',0xF074:'\u03C4',0xF077:'\u03C9',
+  0xF0A3:'\u2264',0xF0A5:'\u221E',0xF0AE:'\u2192',0xF0B0:'\u00B0',0xF0B1:'\u00B1',
+  0xF0B3:'\u2265',0xF0B4:'\u00D7',0xF0B7:'\u00B7',0xF0B8:'\u00F7',0xF0B9:'\u2260',
+  0xF0BB:'\u2248',0xF0C6:'\u21D2',0xF0C7:'\u21D4',0xF0D2:'\u222B',0xF0D4:'\u221A',
+  0xF0D5:'\u220F',0xF0D6:'\u2202',0xF0E5:'\u2211',
+};
+
+function resolveSym(code, font) {
+  if (SYM_MAP[code]) return SYM_MAP[code];
+  if (code >= 0xF000 && code <= 0xF0FF) {
+    const b = code - 0xF000;
+    if (b > 31 && b < 127) return String.fromCharCode(b);
+  }
+  if (code > 31 && code < 0x10000) return String.fromCharCode(code);
+  return '';
+}
+
+function decodeEntities(s) {
+  if (!s) return '';
+  return s
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&#x([0-9A-Fa-f]+);/g, (_, h) => resolveSym(parseInt(h, 16), ''))
+    .replace(/&#(\d+);/g, (_, d) => { try { return String.fromCharCode(+d); } catch { return ''; } })
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+}
+
+function cleanPUA(s) {
+  return s.replace(/[\uF000-\uF0FF]/g, c => resolveSym(c.charCodeAt(0), ''));
+}
+
+/* ============================================================
+   FORMAT DETECTORS (chuan w:highlight / w:shd / w:u / w:b)
+   -> dung cho file Word go tay thong thuong
+============================================================ */
+function isYellow(fill) {
+  if (!fill) return false;
+  const f = fill.toUpperCase().trim();
+  return new Set(['FFED00','FACD5A','FFFF00','FFD700','FFC000','FFCC00',
+    'F9C926','FBD95B','FFEC00','FDFD00','FDD835','FBBC04','F7CE45']).has(f);
+}
+function detHL(r) {
+  if (/<w:highlight\b/i.test(r)) {
+    if (/<w:highlight\s+w:val="none"/i.test(r)) return false;
+    if (/<w:highlight\s+w:val="(?:yellow|darkYellow)"/i.test(r)) return true;
+  }
+  const m = r.match(/<w:shd[^>]+w:fill="([^"]+)"/i);
+  if (m && isYellow(m[1])) return true;
+  return false;
+}
+function detUL(r) {
+  if (!/<w:u\b/i.test(r)) return false;
+  if (/<w:u\s+w:val="none"/i.test(r)) return false;
+  return /<w:u[\s/>]/i.test(r);
+}
+function detBold(r) {
+  const x = r.replace(/<w:bCs[^>]*\/?>/gi, '');
+  if (/<w:b\s*\/>/i.test(x)) return true;
+  if (/<w:b\s+w:val="(?:0|false)"/i.test(x)) return false;
+  if (/<w:b[\s>\/]/i.test(x)) return true;
+  return false;
+}
+
+/* ============================================================
+   VML PICT / FRAME SUPPORT
+   File "PDF-converted" (mỗi đoạn = w:framePr toa do tuyet doi,
+   khong dung w:highlight chuan) ma vung mau vang duoc gia lap
+   bang 1 anh bitmap dan de (v:shape + v:imagedata), nam o mot
+   paragraph hoan toan khac vi tri trong XML.
+   Chien luoc: match theo (trang, toa do x/y gan nhat, roi tie-break
+   bang khoang cach vi tri ky tu trong XML).
+============================================================ */
+
+const PT_TO_TWIP = 20;
+const COORD_TOL = 70;        // dung sai toa do (twips) khi so khop cung trang
+const YELLOW_RATIO_THRESHOLD = 0.30; // % pixel vang de coi la "dai highlight"
+const HL_SHAPE_MAX_HEIGHT_PT = 80;   // dai highlight thuong thap (<= ~1 dong)
+
+function extractPageBreakPositions(xml) {
+  const positions = [];
+  const rx = /<w:br[^>]+w:type="page"/g;
+  let m;
+  while ((m = rx.exec(xml)) !== null) positions.push(m.index);
+  return positions;
+}
+
+function pageIndexForOffset(offset, pageBreaks) {
+  // tra ve so trang (0-indexed) chua offset, dua tren so page-break truoc do
+  let lo = 0, hi = pageBreaks.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (pageBreaks[mid] <= offset) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+function extractFrameParas(xml, pageBreaks) {
+  // tra ve danh sach {offset, x, y, page} cho moi paragraph co w:framePr
+  const out = [];
+  const pRx = /<w:p[ >][\s\S]*?<\/w:p>/g;
+  let m;
+  while ((m = pRx.exec(xml)) !== null) {
+    const p = m[0];
+    const fp = p.match(/<w:framePr\b[^>]*\/?>/);
+    if (!fp) { out.push(null); continue; }
+    const tag = fp[0];
+    const xm = tag.match(/w:x="(-?\d+)"/);
+    const ym = tag.match(/w:y="(-?\d+)"/);
+    if (!xm || !ym) { out.push(null); continue; }
+    out.push({
+      offset: m.index,
+      x: parseInt(xm[1], 10),
+      y: parseInt(ym[1], 10),
+      page: pageIndexForOffset(m.index, pageBreaks),
+    });
+  }
+  return out;
+}
+
+function extractVmlShapes(xml, pageBreaks) {
+  // tra ve danh sach {offset, x, y, w, h, rid, page} cho moi v:shape ben trong w:pict
+  const out = [];
+  const pictRx = /<w:pict>[\s\S]*?<\/w:pict>/g;
+  let m;
+  while ((m = pictRx.exec(xml)) !== null) {
+    const block = m[0];
+    const styleM = block.match(/<v:shape[^>]+style="([^"]+)"/);
+    const ridM = block.match(/<v:imagedata[^>]+r:id="([^"]+)"/);
+    if (!styleM || !ridM) continue;
+    const style = styleM[1];
+    const mlM = style.match(/margin-left:([\d.]+)pt/);
+    const mtM = style.match(/margin-top:([\d.]+)pt/);
+    const wM  = style.match(/width:([\d.]+)pt/);
+    const hM  = style.match(/height:([\d.]+)pt/);
+    if (!mlM || !mtM) continue;
+    out.push({
+      offset: m.index,
+      x: Math.round(parseFloat(mlM[1]) * PT_TO_TWIP),
+      y: Math.round(parseFloat(mtM[1]) * PT_TO_TWIP),
+      wPt: wM ? parseFloat(wM[1]) : 0,
+      hPt: hM ? parseFloat(hM[1]) : 0,
+      rid: ridM[1],
+      page: pageIndexForOffset(m.index, pageBreaks),
+    });
+  }
+  return out;
+}
+
+// phan loai 1 anh: tra ve ti le pixel vang (0..1) bang cach ve len canvas tam
+function yellowRatioFromDataUrl(dataUrl) {
+  return new Promise((resolve) => {
+    try {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+          if (!w || !h) return resolve(0);
+          const cv = document.createElement('canvas');
+          const SCALE = 24; // ha do phan giai de tinh nhanh
+          cv.width = Math.max(1, Math.min(SCALE, w));
+          cv.height = Math.max(1, Math.min(SCALE, h));
+          const ctx = cv.getContext('2d');
+          ctx.drawImage(img, 0, 0, cv.width, cv.height);
+          const data = ctx.getImageData(0, 0, cv.width, cv.height).data;
+          let yellow = 0, total = 0;
+          for (let i = 0; i < data.length; i += 4) {
+            const r = data[i], g = data[i+1], b = data[i+2];
+            total++;
+            if (r > 180 && g > 180 && b < 120) yellow++;
+          }
+          resolve(total ? yellow / total : 0);
+        } catch { resolve(0); }
+      };
+      img.onerror = () => resolve(0);
+      img.src = dataUrl;
+    } catch { resolve(0); }
+  });
+}
+
+// tim frame-paragraph gan nhat (cung trang, trong dung sai toa do), tie-break theo khoang cach offset
+function findClosestFrameIdx(shape, frameParas) {
+  let best = -1, bestDist = Infinity;
+  for (let i = 0; i < frameParas.length; i++) {
+    const fp = frameParas[i];
+    if (!fp || fp.page !== shape.page) continue;
+    const dx = fp.x - shape.x, dy = fp.y - shape.y;
+    if (Math.abs(dx) > COORD_TOL * 4 || Math.abs(dy) > COORD_TOL) continue;
+    const coordDist = Math.sqrt(dx * dx + dy * dy);
+    if (coordDist > COORD_TOL * 3) continue;
+    const offsetDist = Math.abs(fp.offset - shape.offset);
+    // diem so: uu tien toa do gan, sau do offset gan (offset chia ti le nho de khong lan at toa do)
+    const score = coordDist * 1000 + Math.min(offsetDist, 2_000_000) / 1000;
+    if (score < bestDist) { bestDist = score; best = i; }
+  }
+  return best;
+}
+
+// tim cau hoi / dap an "phia tren gan nhat theo y, cung trang" de gan anh minh hoa vao
+function findAnchorForImage(shape, frameParas, paraMeta) {
+  // paraMeta[i] = { qIdx, ansIdx } neu paragraph i la dau cua 1 cau hoi hoac 1 dap an, da duoc build truoc
+  let best = -1, bestY = -Infinity;
+  for (let i = 0; i < frameParas.length; i++) {
+    const fp = frameParas[i];
+    if (!fp || fp.page !== shape.page) continue;
+    if (!paraMeta[i]) continue;
+    if (fp.y <= shape.y + COORD_TOL && fp.y > bestY) { bestY = fp.y; best = i; }
+  }
+  return best;
+}
+
+/* ============================================================
+   PARSE PARAGRAPH (text + format chuan, KHONG doi voi VML)
+============================================================ */
+function parsePara(xml, imgCache) {
+  const res = { text: '', isHL: false, isUL: false, isBold: false, images: [], runs: [] };
+
+  let pHL = false, pUL = false, pBold = false;
+  const pPr = xml.match(/<w:pPr>([\s\S]*?)<\/w:pPr>/);
+  if (pPr) {
+    const rpr = pPr[1].match(/<w:rPr>([\s\S]*?)<\/w:rPr>/);
+    if (rpr) { if (detHL(rpr[1])) pHL = true; if (detUL(rpr[1])) pUL = true; if (detBold(rpr[1])) pBold = true; }
+    const sh = pPr[1].match(/<w:shd[^>]+w:fill="([^"]+)"/i);
+    if (sh && isYellow(sh[1])) pHL = true;
+  }
+
+  const runRx = /<w:r[ >][\s\S]*?<\/w:r>/g;
+  let rm;
+  while ((rm = runRx.exec(xml)) !== null) {
+    const run = rm[0];
+    let rHL = pHL, rUL = pUL, rBold = pBold, font = '';
+    const rPr = run.match(/<w:rPr>([\s\S]*?)<\/w:rPr>/);
+    if (rPr) {
+      if (detHL(rPr[1])) rHL = true;
+      if (detUL(rPr[1])) rUL = true;
+      if (detBold(rPr[1])) rBold = true;
+      const fm = rPr[1].match(/w:ascii="([^"]+)"/i);
+      if (fm) font = fm[1].toLowerCase();
+    }
+    let t = '';
+    const tRx = /<w:t[^>]*>([\s\S]*?)<\/w:t>/g; let tm;
+    while ((tm = tRx.exec(run)) !== null) t += tm[1];
+    const sRx = /<w:sym[^>]+w:char="([^"]+)"(?:[^>]+w:font="([^"]*)")?[^>]*\/?>/g; let sm;
+    while ((sm = sRx.exec(run)) !== null) t += resolveSym(parseInt(sm[1], 16), (sm[2] || font).toLowerCase());
+
+    t = cleanPUA(decodeEntities(t));
+    if (t) {
+      res.runs.push({ text: t, isHL: rHL, isUL: rUL, isBold: rBold });
+      res.text += t;
+      if (rHL) res.isHL = true;
+      if (rUL) res.isUL = true;
+      if (rBold) res.isBold = true;
+    }
+  }
+  res.text = res.text.replace(/\s+/g, ' ').trim();
+
+  // anh DrawingML (chuan, hiem gap trong file PDF-converted nhung van ho tro)
+  let im;
+  const vRx = /<v:imagedata[^>]+r:id="([^"]+)"/g;
+  while ((im = vRx.exec(xml)) !== null) if (imgCache[im[1]]) res.images.push({ src: imgCache[im[1]] });
+  const bRx = /r:embed="([^"]+)"/g;
+  while ((im = bRx.exec(xml)) !== null)
+    if (imgCache[im[1]] && !res.images.find(x => x.src === imgCache[im[1]]))
+      res.images.push({ src: imgCache[im[1]] });
+
+  return res;
+}
+
+/* ============================================================
+   PARSE DOCX (text-flow thuong, dung cho file Word go tay)
+============================================================ */
+function parseParasList(xml, imgCache) {
+  const paras = [];
+  const offsets = [];
+  const pRx = /<w:p[ >][\s\S]*?<\/w:p>/g; let m;
+  while ((m = pRx.exec(xml)) !== null) {
+    paras.push(parsePara(m[0], imgCache));
+    offsets.push(m.index);
+  }
+  return { paras, offsets };
+}
+
+const isQ = t => /^(C[aâ]u|CH)\s*\d+/i.test(t);
+const LETTER_RE = /^\s*([a-dA-D])\s*[.):\-]\s*/;
+
+function buildQuestionsFromParas(paras) {
+  const qs = [];
+  let i = 0;
+  while (i < paras.length) {
+    if (!isQ(paras[i].text)) { i++; continue; }
+    const q = { qText: paras[i].text, qImages: [...paras[i].images], answers: [], _startIdx: i };
+    i++;
+    const body = [];
+    const startBody = i;
+    while (i < paras.length && !isQ(paras[i].text)) { body.push(paras[i]); i++; }
+    buildAnswers(q, body, startBody);
+    q._endIdx = i;
+    qs.push(q);
+  }
+  return qs;
+}
+
+function buildAnswers(q, body, startBody) {
+  const cnt = body.filter(p => LETTER_RE.test(p.text)).length;
+  if (cnt >= 2) buildExplicit(q, body, startBody);
+  else buildImplicit(q, body, startBody);
+}
+
+function buildExplicit(q, body, startBody) {
+  const L = p => { const m = p.text.match(LETTER_RE); return m ? m[1].toUpperCase() : null; };
+  let first = body.findIndex(p => L(p)); if (first < 0) first = 0;
+  for (let i = 0; i < first; i++) { if (body[i].text) q.qText += ' ' + body[i].text; q.qImages.push(...body[i].images); }
+  let cur = null;
+  for (let i = first; i < body.length; i++) {
+    const p = body[i], lt = L(p);
+    if (lt) {
+      cur = {
+        letter: lt,
+        text: p.text.replace(LETTER_RE, '').trim(),
+        isHL: p.isHL || p.runs.some(r => r.isHL),
+        isUL: p.isUL || p.runs.some(r => r.isUL),
+        isBold: p.isBold || p.runs.some(r => r.isBold && r.text.trim()),
+        images: [...p.images],
+        _paraIdx: startBody + i,
+      };
+      q.answers.push(cur);
+    } else if (cur) {
+      if (p.text) cur.text += ' ' + p.text;
+      if (p.isHL || p.runs.some(r => r.isHL)) cur.isHL = true;
+      if (p.isUL || p.runs.some(r => r.isUL)) cur.isUL = true;
+      if (p.isBold || p.runs.some(r => r.isBold && r.text.trim())) cur.isBold = true;
+      cur.images.push(...p.images);
+    } else { if (p.text) q.qText += ' ' + p.text; q.qImages.push(...p.images); }
+  }
+}
+
+function buildImplicit(q, body, startBody) {
+  const SKIP = /^(V[oớ]i|With|Note|Ghi ch[uú]|Bi[eế]t|Cho r[aằ]ng|H[ìi]nh|Figure)/i;
+  const tp = body.filter(p => p.text.trim() || p.images.length);
+  const cand = tp.filter(p => p.text.trim() ? !SKIP.test(p.text) : p.images.length > 0);
+  tp.filter(p => !cand.includes(p)).forEach(p => { if (p.text) q.qText += ' ' + p.text; q.qImages.push(...p.images); });
+  const L = ['A','B','C','D','E','F'];
+  cand.forEach((p, i) => {
+    const idxInBody = body.indexOf(p);
+    q.answers.push({
+      letter: L[i] || String(i + 1),
+      text: p.text.trim(),
+      isHL: p.isHL || p.runs.some(r => r.isHL),
+      isUL: p.isUL || p.runs.some(r => r.isUL),
+      isBold: p.isBold || p.runs.some(r => r.isBold && r.text.trim()),
+      images: p.images,
+      _paraIdx: startBody + idxInBody,
+    });
+  });
+}
+
+/* ============================================================
+   FRAME-MODE: gan highlight (dai vang VML) + anh minh hoa
+   vao dung cau hoi/dap an dua tren toa do trang.
+============================================================ */
+async function applyFrameModeOverlays(xml, questions, paras, paraOffsets, imgCache, ridYellowCache) {
+  const pageBreaks = extractPageBreakPositions(xml);
+  const frameParas = extractFrameParas(xml, pageBreaks);
+  const shapes = extractVmlShapes(xml, pageBreaks);
+  if (!shapes.length) return { hlCount: 0, imgCount: 0 };
+
+  // map paragraph-index -> {qIdx, ansIdx} de biet paragraph nao la "anchor" cua cau hoi/dap an
+  const paraMeta = new Array(paras.length).fill(null);
+  questions.forEach((q, qi) => {
+    if (typeof q._startIdx === 'number') paraMeta[q._startIdx] = { qIdx: qi, ansIdx: -1 };
+    q.answers.forEach((a, ai) => { if (typeof a._paraIdx === 'number') paraMeta[a._paraIdx] = { qIdx: qi, ansIdx: ai }; });
+  });
+
+  let hlCount = 0, imgCount = 0;
+
+  for (const shape of shapes) {
+    const dataUrl = imgCache[shape.rid];
+    if (!dataUrl) continue;
+
+    let ratio = ridYellowCache.get(shape.rid);
+    if (ratio === undefined) {
+      ratio = await yellowRatioFromDataUrl(dataUrl);
+      ridYellowCache.set(shape.rid, ratio);
+    }
+
+    const isHighlightStripe = ratio >= YELLOW_RATIO_THRESHOLD && shape.hPt <= HL_SHAPE_MAX_HEIGHT_PT;
+
+    if (isHighlightStripe) {
+      const idx = findClosestFrameIdx(shape, frameParas);
+      if (idx < 0) continue;
+      const meta = paraMeta[idx];
+      if (!meta) continue;
+      if (meta.ansIdx >= 0) {
+        questions[meta.qIdx].answers[meta.ansIdx].isHL = true;
+        hlCount++;
+      } else {
+        // highlight roi vao chinh phan dau cau hoi (hiem, nhung van xu ly)
+        questions[meta.qIdx]._qHL = true;
+      }
+    } else {
+      // anh minh hoa thuc su -> gan vao cau hoi hoac dap an gan nhat PHIA TREN (theo y)
+      const idx = findAnchorForImage(shape, frameParas, paraMeta);
+      if (idx < 0) continue;
+      const meta = paraMeta[idx];
+      if (!meta) continue;
+      if (meta.ansIdx >= 0) {
+        questions[meta.qIdx].answers[meta.ansIdx].images.push({ src: dataUrl });
+      } else {
+        questions[meta.qIdx].qImages.push({ src: dataUrl });
+      }
+      imgCount++;
+    }
+  }
+
+  return { hlCount, imgCount };
+}
+
+/* ============================================================
+   UI PANEL
+============================================================ */
+const panel = document.createElement('div');
+panel.id = 'dxa';
+panel.style.cssText = 'position:fixed;top:20px;right:20px;z-index:2147483647;width:520px;max-width:95vw;background:#fff;border:1.5px solid #d1d5db;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.18);font-family:"Segoe UI",Tahoma,Arial,sans-serif;font-size:14px;color:#111827;overflow:hidden;';
+panel.innerHTML = `
+<div id="dxh" style="background:linear-gradient(135deg,#1e40af,#2563eb);padding:10px 14px;display:flex;justify-content:space-between;align-items:center;cursor:move;gap:8px;user-select:none;">
+  <span style="font-weight:700;font-size:14px;color:#fff;">DOCX Reader v11</span>
+  <div style="display:flex;gap:6px;align-items:center;flex-shrink:0;">
+    <span style="font-size:9px;color:rgba(255,255,255,.7);background:rgba(0,0,0,.25);padding:2px 7px;border-radius:4px;">ShiftLeft: an/hien</span>
+    <button id="dxmin" style="background:rgba(255,255,255,.15);border:none;color:#fff;font-size:14px;cursor:pointer;border-radius:5px;width:24px;height:24px;font-weight:700;">_</button>
+    <button id="dxx" style="background:rgba(220,38,38,.85);border:none;color:#fff;font-size:16px;cursor:pointer;border-radius:5px;width:24px;height:24px;font-weight:700;line-height:1;">x</button>
+  </div>
+</div>
+<div id="dxbody" style="padding:12px;">
+  <div style="font-size:10px;color:#6b7280;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">CHON FILE .DOCX</div>
+  <div style="display:flex;gap:8px;margin-bottom:10px;">
+    <button id="dxpick" style="flex:1;padding:9px 12px;background:#f9fafb;border:1.5px dashed #93c5fd;border-radius:8px;cursor:pointer;color:#2563eb;font-size:12px;font-weight:600;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Nhan de chon file Word...</button>
+    <button id="dxrd" disabled style="padding:9px 14px;background:#e5e7eb;color:#9ca3af;border:none;border-radius:8px;font-size:12px;font-weight:700;cursor:not-allowed;white-space:nowrap;">Doc File</button>
+  </div>
+  <input type="file" id="dxfi" accept=".docx" style="display:none;">
+
+  <div style="font-size:10px;color:#6b7280;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">TIM KIEM CAU HOI</div>
+  <div style="display:flex;gap:8px;margin-bottom:8px;">
+    <input id="dxq" type="text" placeholder="Nhap tu khoa cau hoi..." disabled style="flex:1;padding:9px 10px;background:#f9fafb;border:1.5px solid #d1d5db;border-radius:8px;font-size:13px;color:#111827;outline:none;font-family:inherit;">
+    <button id="dxs" disabled style="padding:9px 16px;background:#e5e7eb;color:#9ca3af;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:not-allowed;">Tim</button>
+    <button id="dxtab" disabled title="Mo tat ca trong tab moi" style="padding:9px 12px;background:#e5e7eb;color:#9ca3af;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:not-allowed;white-space:nowrap;">Tab moi</button>
+  </div>
+
+  <div id="dxst" style="font-size:11px;color:#6b7280;font-weight:600;min-height:16px;padding:2px 0;"></div>
+  <div id="dxlg" style="display:none;gap:4px;flex-wrap:wrap;margin:4px 0;">
+    <span style="font-size:10px;background:#fffbe6;color:#92400e;padding:2px 8px;border-radius:4px;font-weight:700;border-left:3px solid #f59e0b;">Boi vang = DUNG</span>
+    <span style="font-size:10px;background:#eff6ff;color:#1e40af;padding:2px 8px;border-radius:4px;font-weight:700;border-left:3px solid #3b82f6;">Gach chan = DUNG</span>
+    <span style="font-size:10px;background:#f0fdf4;color:#15803d;padding:2px 8px;border-radius:4px;font-weight:700;border-left:3px solid #22c55e;">In dam = DUNG</span>
+  </div>
+  <div id="dxout" style="max-height:440px;overflow-y:auto;margin-top:4px;"></div>
+</div>
+<style>
+#dxout .qb{background:#fff;border:1.5px solid #e5e7eb;border-left:4px solid #2563eb;border-radius:8px;padding:10px 12px;margin-bottom:10px;}
+#dxout .qt{font-size:13px;line-height:1.75;color:#111827;margin-bottom:7px;word-break:break-word;}
+#dxout .ar{display:flex;align-items:flex-start;gap:6px;margin:2px 0;padding:5px 8px;border-radius:6px;font-size:13px;line-height:1.6;word-break:break-word;border-left:3px solid transparent;}
+#dxout .al{font-weight:700;min-width:22px;flex-shrink:0;}
+#dxout .ac{flex:1;word-break:break-word;}
+#dxout .ar img,#dxout .iw img{max-width:100%;height:auto;border-radius:4px;display:block;margin:3px 0;border:1px solid #e5e7eb;}
+#dxout .c-hl{background:#fffbe6;border-left:3px solid #f59e0b !important;color:#78350f;}
+#dxout .c-ul{background:#eff6ff;border-left:3px solid #3b82f6 !important;color:#1e3a8a;}
+#dxout .c-bd{background:#f0fdf4;border-left:3px solid #22c55e !important;color:#14532d;font-weight:700;}
+#dxout .bg{display:inline-block;font-size:10px;padding:1px 6px;border-radius:4px;margin-left:6px;font-weight:700;color:#fff;}
+#dxout .bg-hl{background:#f59e0b;}#dxout .bg-ul{background:#3b82f6;}#dxout .bg-bd{background:#22c55e;}
+#dxout .sum{margin-top:7px;padding:5px 10px;background:#f0fdf4;border-radius:6px;font-size:12px;color:#15803d;font-weight:700;border-left:3px solid #22c55e;}
+#dxout mark{background:#fbbf24;color:#111827;border-radius:2px;padding:0 2px;font-weight:700;}
+#dxout::-webkit-scrollbar{width:6px;}#dxout::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:3px;}
+</style>`;
+document.body.appendChild(panel);
+
+const $ = id => panel.querySelector('#' + id);
+const fi = $('dxfi'), pick = $('dxpick'), rdBtn = $('dxrd');
+const qIn = $('dxq'), sBtn = $('dxs'), tabBtn = $('dxtab'), stEl = $('dxst');
+const out = $('dxout'), hdr = $('dxh'), xBtn = $('dxx'), minBtn = $('dxmin'), lgEl = $('dxlg'), body = $('dxbody');
+
+/* ---- drag ---- */
+let drag = false, dX = 0, dY = 0;
+hdr.addEventListener('mousedown', e => {
+  if (e.target.tagName === 'BUTTON') return;
+  drag = true; dX = e.clientX - panel.getBoundingClientRect().left; dY = e.clientY - panel.getBoundingClientRect().top; e.preventDefault();
+});
+document.addEventListener('mousemove', e => {
+  if (!drag) return;
+  panel.style.right = 'auto';
+  panel.style.left = Math.max(0, Math.min(innerWidth - panel.offsetWidth, e.clientX - dX)) + 'px';
+  panel.style.top = Math.max(0, Math.min(innerHeight - 40, e.clientY - dY)) + 'px';
+});
+document.addEventListener('mouseup', () => drag = false);
+
+/* ---- controls ---- */
+document.addEventListener('keydown', e => {
+  if (e.code === 'ShiftLeft' && !e.repeat && e.target.tagName !== 'INPUT') {
+    panelVis = !panelVis; panel.style.display = panelVis ? 'block' : 'none';
+  }
+});
+xBtn.onclick = () => { panel.style.display = 'none'; panelVis = false; };
+minBtn.onclick = () => { minimized = !minimized; body.style.display = minimized ? 'none' : 'block'; minBtn.textContent = minimized ? '+' : '_'; };
+
+/* ---- FILE PICK ---- */
+pick.onclick = () => fi.click();
+fi.onchange = () => {
+  const f = fi.files[0];
+  if (!f) return;
+  if (!/\.docx$/i.test(f.name)) { setSt('Chi ho tro file .docx!', '#dc2626'); return; }
+  selFile = f;
+  const nm = f.name.length > 40 ? f.name.slice(0, 37) + '...' : f.name;
+  pick.textContent = nm;
+  pick.style.color = '#1d4ed8';
+  pick.style.borderStyle = 'solid';
+  enBtn(rdBtn, '#1d4ed8', '#fff');
+  setSt('Da chon file. Nhan "Doc File".', '#16a34a');
+};
+
+/* ---- READ ---- */
+rdBtn.onclick = async () => {
+  if (!selFile) { setSt('Chua chon file!', '#dc2626'); return; }
+  setSt('Dang doc file...', '#d97706');
+  out.innerHTML = ''; questions = [];
+  rdBtn.disabled = true; rdBtn.textContent = '...';
+  try {
+    if (typeof JSZip === 'undefined') throw new Error('JSZip chua load. Reload trang.');
+    const buf = await selFile.arrayBuffer();
+    const zip = await JSZip.loadAsync(buf);
+
+    const relsF = zip.file('word/_rels/document.xml.rels');
+    const rels = {};
+    if (relsF) {
+      const rx = await relsF.async('string');
+      for (const m of rx.matchAll(/Id="([^"]+)"[^>]+Target="([^"]+)"/g)) rels[m[1]] = m[2];
+    }
+
+    const imgCache = {};
+    await Promise.all(Object.entries(rels).map(async ([rid, tgt]) => {
+      if (!/\.(jpe?g|png|gif|webp|bmp)$/i.test(tgt)) return;
+      for (const p of ['word/' + tgt, tgt.replace(/^\.?\//, ''), 'word/media/' + tgt.split('/').pop()]) {
+        if (!zip.file(p)) continue;
+        try {
+          const b64 = await zip.file(p).async('base64');
+          const ext = tgt.split('.').pop().toLowerCase();
+          const mime = { jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif', webp:'image/webp', bmp:'image/bmp' }[ext] || 'image/png';
+          imgCache[rid] = `data:${mime};base64,${b64}`;
+        } catch {}
+        break;
+      }
+    }));
+
+    const docF = zip.file('word/document.xml');
+    if (!docF) throw new Error('Khong tim thay document.xml');
+    const xml = await docF.async('string');
+
+    setSt('Dang phan tich cau hoi...', '#d97706');
+    const { paras, offsets } = parseParasList(xml, imgCache);
+    questions = buildQuestionsFromParas(paras);
+
+    // Frame-mode overlay: chi chay neu phat hien w:framePr + v:shape (file kieu PDF-converted)
+    const hasFrameMode = /<w:framePr\b/.test(xml) && /<w:pict>/.test(xml);
+    let ovStats = { hlCount: 0, imgCount: 0 };
+    if (hasFrameMode) {
+      setSt('Dang doi chieu vung boi vang & hinh anh (frame-mode)...', '#d97706');
+      const ridYellowCache = new Map();
+      ovStats = await applyFrameModeOverlays(xml, questions, paras, offsets, imgCache, ridYellowCache);
+    }
+
+    const cImg = questions.reduce((n, q) => n + q.qImages.length + q.answers.reduce((m, a) => m + a.images.length, 0), 0);
+    setSt(`Da doc: ${questions.length} cau | ${Object.keys(imgCache).length} anh goc | ${ovStats.hlCount} dap an boi vang | ${cImg} anh hien thi`, '#16a34a');
+    lgEl.style.display = 'flex';
+    qIn.disabled = false; qIn.style.border = '1.5px solid #1d4ed8';
+    enBtn(sBtn, '#16a34a', '#fff');
+    enBtn(tabBtn, '#7c3aed', '#fff');
+    preview();
+  } catch (e) {
+    setSt('Loi: ' + e.message, '#dc2626'); console.error('[dxa]', e);
+  } finally {
+    rdBtn.disabled = false; rdBtn.textContent = 'Doc File';
+  }
+};
+
+/* ---- preview ---- */
+function preview() {
+  const s = questions.slice(0, 5);
+  const c = questions.filter(q => q.answers.some(a => a.isHL || a.isUL || a.isBold)).length;
+  out.innerHTML = `<div style="background:#f9fafb;border-radius:8px;padding:10px 12px;border:1.5px solid #e5e7eb;">
+    <div style="font-size:10px;color:#9ca3af;margin-bottom:4px;font-weight:700;text-transform:uppercase;">Xem truoc (${questions.length} cau, ${c} co dap an):</div>
+    ${s.map(q => `<div style="font-size:12px;color:#374151;padding:3px 0;border-bottom:1px solid #f3f4f6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(q.qText.slice(0, 80))}${q.answers.some(a => a.isHL || a.isUL || a.isBold) ? ' <span style="color:#16a34a;font-weight:700;">[co dap an]</span>' : ''}</div>`).join('')}
+    <div style="font-size:11px;color:#9ca3af;margin-top:6px;">Nhap tu khoa va nhan Tim</div></div>`;
+}
+
+/* ---- SEARCH ---- */
+function search() {
+  const kw = qIn.value.trim();
+  if (!kw) { setSt('Nhap tu khoa!', '#d97706'); return []; }
+  if (!questions.length) { setSt('Chua doc file!', '#dc2626'); return []; }
+  const norm = s => (s || '').toLowerCase().normalize('NFC').replace(/\s+/g, ' ').trim();
+  const kn = norm(kw), kw2 = kn.split(/\s+/).filter(w => w.length >= 2);
+  const score = txt => {
+    const t = norm(txt);
+    if (t.includes(kn)) return 100;
+    if (kw2.length) { const r = kw2.filter(w => t.includes(w)).length / kw2.length; if (r >= 0.5) return Math.round(r * 90); }
+    const p = kn.slice(0, Math.min(18, kn.length));
+    if (p.length >= 4 && t.includes(p)) return 65;
+    return 0;
+  };
+  return questions.map(q => ({ q, s: score(q.qText) })).filter(x => x.s > 0).sort((a, b) => b.s - a.s).slice(0, 15);
+}
+
+sBtn.onclick = () => {
+  const res = search();
+  if (!res || !res.length) {
+    if (qIn.value.trim()) {
+      setSt(`Khong tim thay "${qIn.value.trim()}"`, '#dc2626');
+      out.innerHTML = `<div style="text-align:center;padding:24px;color:#dc2626;">Khong co ket qua<div style="font-size:11px;color:#6b7280;margin-top:6px;">Thu 4-8 tu dau cau</div></div>`;
+    }
+    return;
+  }
+  setSt(`Tim thay ${res.length} ket qua`, '#16a34a');
+  out.innerHTML = res.map((x, i) => renderQ(x.q, i, x.s, qIn.value.trim())).join('');
+  out.scrollTop = 0;
+};
+qIn.onkeydown = e => { if (e.key === 'Enter') sBtn.click(); };
+
+/* ---- OPEN IN NEW TAB ---- */
+tabBtn.onclick = () => {
+  const res = qIn.value.trim() ? search() : questions.map((q) => ({ q, s: 0 }));
+  if (!res || !res.length) { setSt('Khong co du lieu de mo', '#dc2626'); return; }
+  const html = buildTabHtml(res, qIn.value.trim());
+  const w = window.open('', '_blank');
+  if (!w) { setSt('Trinh duyet chan popup. Cho phep popup roi thu lai.', '#dc2626'); return; }
+  w.document.open(); w.document.write(html); w.document.close();
+  setSt(`Da mo ${res.length} cau o tab moi`, '#7c3aed');
+};
+
+function buildTabHtml(res, kw) {
+  const body = res.map((x, i) => renderQ(x.q, i, x.s, kw)).join('');
+  return `<!DOCTYPE html><html lang="vi"><head><meta charset="utf-8">
+<title>Ket qua DOCX Reader (${res.length} cau)</title>
+<style>
+body{font-family:"Segoe UI",Tahoma,Arial,sans-serif;background:#f3f4f6;margin:0;padding:24px;color:#111827;}
+.wrap{max-width:860px;margin:0 auto;}
+h1{font-size:20px;color:#1e40af;}
+.qb{background:#fff;border:1.5px solid #e5e7eb;border-left:4px solid #2563eb;border-radius:10px;padding:14px 18px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.06);}
+.qt{font-size:15px;line-height:1.8;margin-bottom:10px;}
+.ar{display:flex;gap:8px;margin:4px 0;padding:7px 12px;border-radius:8px;font-size:15px;line-height:1.7;border-left:3px solid transparent;}
+.al{font-weight:700;min-width:24px;}.ac{flex:1;}
+.ar img,.iw img{max-width:100%;height:auto;border-radius:4px;border:1px solid #e5e7eb;margin:4px 0;}
+.c-hl{background:#fffbe6;border-left:3px solid #f59e0b!important;color:#78350f;}
+.c-ul{background:#eff6ff;border-left:3px solid #3b82f6!important;color:#1e3a8a;}
+.c-bd{background:#f0fdf4;border-left:3px solid #22c55e!important;color:#14532d;font-weight:700;}
+.bg{display:inline-block;font-size:11px;padding:2px 8px;border-radius:5px;margin-left:8px;font-weight:700;color:#fff;}
+.bg-hl{background:#f59e0b;}.bg-ul{background:#3b82f6;}.bg-bd{background:#22c55e;}
+.sum{margin-top:10px;padding:7px 12px;background:#f0fdf4;border-radius:8px;font-size:14px;color:#15803d;font-weight:700;border-left:3px solid #22c55e;}
+mark{background:#fbbf24;color:#111827;border-radius:2px;padding:0 2px;}
+</style></head><body><div class="wrap">
+<h1>Ket qua: ${res.length} cau ${kw ? '("' + esc(kw) + '")' : ''}</h1>
+${body}</div></body></html>`;
+}
+
+/* ---- RENDER ---- */
+function renderQ(q, i, sc, kw) {
+  const col = sc === 100 ? '#16a34a' : sc >= 75 ? '#d97706' : '#6b7280';
+  const qImg = q.qImages.map(im => `<div class="iw"><img src="${im.src}" loading="lazy"></div>`).join('');
+  const corr = q.answers.filter(a => a.isHL || a.isUL || a.isBold);
+  const ans = q.answers.length ? q.answers.map(renderA).join('') : `<div style="color:#9ca3af;font-style:italic;padding:4px;">Khong phan tich duoc dap an</div>`;
+  const sum = corr.length ? `<div class="sum">DAP AN DUNG: ${corr.map(a => a.letter).join(', ')}</div>` : '';
+  return `<div class="qb">
+    <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="font-size:10px;color:#9ca3af;font-weight:700;">#${i + 1}</span>${sc ? `<span style="font-size:10px;color:${col};background:${col}18;padding:1px 7px;border-radius:4px;font-weight:700;">${sc}%</span>` : ''}</div>
+    <div class="qt">${hlKw(esc(q.qText), kw)}</div>${qImg}${ans}${sum}</div>`;
+}
+function renderA(a) {
+  let c = '', b = '';
+  if (a.isHL) { c = 'c-hl'; b = '<span class="bg bg-hl">BOI VANG - DUNG</span>'; }
+  else if (a.isUL) { c = 'c-ul'; b = '<span class="bg bg-ul">GACH CHAN - DUNG</span>'; }
+  else if (a.isBold) { c = 'c-bd'; b = '<span class="bg bg-bd">IN DAM - DUNG</span>'; }
+  const img = a.images.map(im => `<div class="iw"><img src="${im.src}" loading="lazy"></div>`).join('');
+  return `<div class="ar ${c}"><span class="al">${esc(a.letter)}.</span><div class="ac">${esc(a.text)}${b}${img}</div></div>`;
+}
+
+/* ---- helpers ---- */
+function hlKw(html, kw) {
+  if (!kw) return html;
+  kw.split(/\s+/).filter(w => w.length >= 2).forEach(w => {
+    try { html = html.replace(new RegExp('(' + w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi'), '<mark>$1</mark>'); } catch {}
+  });
+  return html;
+}
+function esc(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function setSt(m, c = '#6b7280') { stEl.textContent = m; stEl.style.color = c; }
+function enBtn(b, bg, c) { b.disabled = false; b.style.background = bg; b.style.color = c; b.style.cursor = 'pointer'; }
+
+})();
