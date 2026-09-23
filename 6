@@ -1,0 +1,1106 @@
+// ==UserScript==
+// @name         1( maker aumon)
+// @namespace    http://tampermonkey.net/
+// @version      43.1
+// @description  v43.1 - FIX: window.name cleared inside clickOnTargetSite (not top-level), isOpenedByScript restored, real free vision models, CLIP excluded.
+// @match        https://taplayma.com/*
+// @match        https://www.google.com/url*
+// @match        *://*/*
+// @grant        GM_setClipboard
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @grant        unsafeWindow
+// @run-at       document-start
+// @connect      openrouter.ai
+// @connect      *
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ─── CONFIG ───────────────────────────────────────────────────────────
+    const API_KEY         = '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';
+    const TARGET_SELECTOR = 'img[data-v-f897f214]';
+
+    const TAB_NAME      = 'ocr_target_v42';
+    const IMG_MAP_KEY   = 'ocr_img_map_v42';
+    const COUNTDOWN_KEY = 'ocr_countdown_end_v42';
+    const CODE_KEY      = 'ocr_pending_code_v42';
+
+    // ─── [FIX] REAL FREE VISION MODELS từ OpenRouter ─────────────────────
+    const HARDCODED_FREE_VISION_MODELS = [
+        'meta-llama/llama-3.2-11b-vision-instruct:free',
+        'qwen/qwen2-vl-7b-instruct:free',
+        'google/gemini-flash-1.5:free',
+        'google/gemini-2.0-flash-exp:free',
+        'moondream/moondream2:free',
+        'microsoft/phi-3.5-mini-128k-instruct:free',
+    ];
+
+    // ─── [FIX] isForceRunTab: KHÔNG clear window.name ở đây ──────────────
+    // window.name phải còn để trang đích nhận ra sau khi google redirect
+    // Chỉ clear bên trong clickOnTargetSite() khi đã chạy xong
+    const isForceRunTab = (window.name === TAB_NAME);
+    if (isForceRunTab) {
+        _installForceRun(window);
+    }
+
+    // ─── FORCE-RUN ────────────────────────────────────────────────────────
+    function _installForceRun(win) {
+        try {
+            Object.defineProperty(win.document, 'hidden',          { get: () => false,     configurable: true });
+            Object.defineProperty(win.document, 'visibilityState', { get: () => 'visible', configurable: true });
+            win.document.addEventListener('visibilitychange', e => { e.stopImmediatePropagation(); e.preventDefault(); }, true);
+        } catch (_) {}
+        const _keepRaf = () => win.requestAnimationFrame(_keepRaf);
+        win.requestAnimationFrame(_keepRaf);
+        const WORKER_CODE = `var timers={};self.onmessage=function(e){var m=e.data;if(m.cmd==='ST'){var tid=setTimeout(function(){delete timers[m.mid];self.postMessage({mid:m.mid,type:'ST'});},m.delay);timers[m.mid]=tid;}else if(m.cmd==='SI'){var tid=setInterval(function(){self.postMessage({mid:m.mid,type:'SI'});},m.delay);timers[m.mid]=tid;}else if(m.cmd==='CLR'){if(timers[m.mid]){clearTimeout(timers[m.mid]);clearInterval(timers[m.mid]);delete timers[m.mid];}}};`;
+        let _timerWorker = null;
+        try { const blob = new Blob([WORKER_CODE], { type: 'application/javascript' }); _timerWorker = new Worker(URL.createObjectURL(blob)); } catch (_) {}
+        if (_timerWorker) {
+            const _cbMap = new Map(); let _mid = 1;
+            _timerWorker.onmessage = function(e) {
+                const { mid, type } = e.data; const entry = _cbMap.get(mid); if (!entry) return;
+                try { if (typeof entry.fn === 'function') entry.fn(...(entry.args || [])); else { try { eval(entry.fn); } catch(_){} } } catch(_) {}
+                if (type === 'ST') _cbMap.delete(mid);
+            };
+            const _origST = win.setTimeout.bind(win), _origSI = win.setInterval.bind(win), _origCST = win.clearTimeout.bind(win);
+            win.setTimeout  = function(fn, delay, ...args) { delay=+delay||0; if(delay<300)return _origST(fn,delay,...args); const mid=_mid++;_cbMap.set(mid,{fn,args});_timerWorker.postMessage({cmd:'ST',mid,delay});return -(mid+900000); };
+            win.setInterval = function(fn, delay, ...args) { delay=+delay||4;  if(delay<300)return _origSI(fn,delay,...args); const mid=_mid++;_cbMap.set(mid,{fn,args,repeat:true});_timerWorker.postMessage({cmd:'SI',mid,delay});return -(mid+900000); };
+            const _clearShared = id => { if(typeof id==='number'&&id<-900000){const mid=-(id+900000);_cbMap.delete(mid);_timerWorker.postMessage({cmd:'CLR',mid});}else{_origCST(id);}};
+            win.clearTimeout = _clearShared; win.clearInterval = _clearShared;
+        }
+        try {
+            const AC = win.AudioContext || win.webkitAudioContext;
+            if (AC) { const ac=new AC(),buf=ac.createBuffer(1,1,22050),src=ac.createBufferSource(),g=ac.createGain();g.gain.value=0.00001;src.buffer=buf;src.loop=true;src.connect(g);g.connect(_ac.destination);src.start(0);setInterval(()=>{if(ac.state==='suspended')ac.resume();},1000); }
+        } catch(_) {}
+    }
+
+    // ─── GOOGLE REDIRECT ──────────────────────────────────────────────────
+    const host = location.hostname;
+    if (host.includes('google.com') && location.pathname === '/url') {
+        const real = new URLSearchParams(location.search).get('q');
+        if (real) location.href = real;
+        return;
+    }
+
+    const isOnTaplayma = host.includes('taplayma.com');
+
+    // ─── [FIX] isOpenedByScript: dùng lại logic gốc đơn giản ─────────────
+    // KHÔNG dùng cross-origin hostname check (luôn throw exception → return false)
+    // window.opener && !window.opener.closed là đủ để biết tab do script mở
+    const isOpenedByScript = isForceRunTab || (() => {
+        try { return !isOnTaplayma && !!window.opener && !window.opener.closed; }
+        catch(e) { return false; }
+    })();
+
+    if (!isOnTaplayma && !isOpenedByScript) return;
+
+    // ─── HELPERS ──────────────────────────────────────────────────────────
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    function workerSleep(ms, onTick) {
+        return new Promise(resolve => {
+            const code = `var start=Date.now(),dur=${ms};var iv=setInterval(function(){var el=Date.now()-start,rem=Math.max(0,dur-el);self.postMessage({elapsed:el,remaining:rem});if(el>=dur){clearInterval(iv);self.postMessage({done:true});}},200);`;
+            const w = new Worker(URL.createObjectURL(new Blob([code], { type: 'application/javascript' })));
+            w.onmessage = e => { if (e.data.done) { w.terminate(); resolve(); } else if (onTick) onTick(e.data.remaining); };
+        });
+    }
+
+    // ─── AUDIO THROTTLE PREVENTION ────────────────────────────────────────
+    let _ac = null;
+    function preventThrottling() {
+        const tryStart = () => {
+            try {
+                const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+                if (!_ac) { _ac=new AC();const buf=_ac.createBuffer(1,1,22050),src=_ac.createBufferSource(),g=_ac.createGain();g.gain.value=0.00001;src.buffer=buf;src.loop=true;src.connect(g);g.connect(_ac.destination);src.start(0); }
+                if (_ac.state === 'suspended') _ac.resume();
+            } catch(_) {}
+        };
+        tryStart();
+        ['click','touchstart','keydown'].forEach(ev => document.addEventListener(ev, tryStart, {passive:true}));
+        setInterval(() => { if (_ac && _ac.state==='suspended') _ac.resume(); }, 2000);
+    }
+
+    // ─── STORAGE ──────────────────────────────────────────────────────────
+    const getList  = () => { try { return JSON.parse(localStorage.getItem('url_list') || '[]'); } catch { return []; } };
+    const saveList = l  => localStorage.setItem('url_list', JSON.stringify(l));
+    function addURL(url) { const l=getList(); if(!l.includes(url)){l.unshift(url);saveList(l);} }
+
+    function getImgMap()   { try { return JSON.parse(localStorage.getItem(IMG_MAP_KEY)||'{}'); } catch { return {}; } }
+    function saveImgMap(m) { localStorage.setItem(IMG_MAP_KEY, JSON.stringify(m)); }
+    function normKey(src) {
+        if (!src) return '';
+        try { const u=new URL(src); return (u.origin+u.pathname).toLowerCase(); }
+        catch { return src.toLowerCase().replace(/\?.*$/,''); }
+    }
+    function saveImgURL(imgSrc, url, votes) {
+        if (!imgSrc||!url) return;
+        const m=getImgMap(), k=normKey(imgSrc); if(!k) return;
+        const prev=m[k]||{count:0};
+        m[k]={url,votes:votes||1,lastSeen:Date.now(),count:(prev.count||0)+1};
+        saveImgMap(m);
+    }
+    function lookupImgURL(imgSrc) {
+        if (!imgSrc) return null;
+        const m=getImgMap(), k=normKey(imgSrc);
+        return m[k] ? m[k].url : null;
+    }
+
+    // ─── EXPORT / IMPORT ──────────────────────────────────────────────────
+    function exportData() {
+        const payload = {version:'v43.1',exported_at:new Date().toISOString(),url_list:getList(),ocr_img_map:getImgMap()};
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([JSON.stringify(payload,null,2)], {type:'application/json'}));
+        a.download = `taplayma_backup_${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+    }
+
+    function importData(file, onDone) {
+        const r = new FileReader();
+        r.onload = e => {
+            try {
+                const data = JSON.parse(e.target.result);
+                let au = 0, ai = 0;
+                if(Array.isArray(data.url_list)) {
+                    const cur = getList();
+                    const merged = [...new Set([...data.url_list,...cur])];
+                    saveList(merged);
+                    au = data.url_list.filter(u => !cur.includes(u)).length;
+                }
+                if(data.ocr_img_map && typeof data.ocr_img_map === 'object') {
+                    const cur = getImgMap();
+                    for(const [k, v] of Object.entries(data.ocr_img_map)) {
+                        if(!cur[k] || (v.lastSeen || 0) > (cur[k].lastSeen || 0)) { cur[k] = v; ai++; }
+                    }
+                    saveImgMap(cur);
+                }
+                onDone(`+${au} URL, +${ai} ảnh`,'ok');
+            } catch(err) { onDone('File lỗi: ' + err.message,'err'); }
+        };
+        r.readAsText(file);
+    }
+
+    // ─── DOM URL SCAN ─────────────────────────────────────────────────────
+    const TLD_LIST = ['com','net','org','io','vn','co','app','link','site','me','tv','gg','bet','win','club','live','online','xyz','info','pro','cc','us','uk','id','sg','ph','th','my','top','fun','store','shop','game','nl','de','fr','jp','ru','au','ca','br','in','es','it','pl','se','no','dk','fi','be','at','ch','gr','pt','tr','mx','ar','cl','pe','nz','biz','mobi','asia'];
+    const TLD_PAT  = TLD_LIST.join('|');
+
+    function cleanURL(u) {
+        if (!u) return '';
+        u = u.trim();
+        u = u.replace(/[.,;:!?)>"''«»\]`]+$/g, '').trim();
+        if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+        u = u.replace(/\.{2,}/g, '.').replace(/\/+$/, '');
+        return u;
+    }
+
+    function isValidURL(u) {
+        if (!u || u.length < 10) return false;
+        if (!/^https?:\/\//i.test(u)) return false;
+        if (!/https?:\/\/[a-zA-Z0-9\-]{2,}\.[a-zA-Z]{2,}/i.test(u)) return false;
+        if (/\.\.\.|localhost|127\.|192\.168\./.test(u)) return false;
+        const domain = u.replace(/^https?:\/\//i,'').split('/')[0];
+        const parts = domain.split('.');
+        if (parts.length < 2 || parts[0].length < 2) return false;
+        if (/[^a-zA-Z0-9\-\.]/.test(domain)) return false;
+        return TLD_LIST.includes(parts[parts.length - 1].toLowerCase());
+    }
+
+    function scanPageMetaURLs() {
+        const found = new Set();
+        const add = u => { const c = cleanURL(u); if(isValidURL(c) && !c.includes('taplayma') && !c.includes('google.com')) found.add(c); };
+        const canonical = document.querySelector('link[rel="canonical"]'); if(canonical?.href) add(canonical.href);
+        const ogUrl = document.querySelector('meta[property="og:url"]');   if(ogUrl?.content)  add(ogUrl.content);
+        const twUrl = document.querySelector('meta[name="twitter:url"]');  if(twUrl?.content)  add(twUrl.content);
+        return [...found];
+    }
+
+    function quickScanDOMForURL() {
+        const found = new Set();
+        for (const u of scanPageMetaURLs()) found.add(u);
+        const TLD_RE = new RegExp(`https?:\\/\\/[^\\s<>"']{4,}|www\\.[a-zA-Z0-9\\-]{2,60}\\.(?:${TLD_PAT})(?:\\/[^\\s<>"']*)?`, 'gi');
+        for (const el of document.querySelectorAll('cite,a,span,div,p,small,[class*="url"],[class*="link"]')) {
+            if (el.offsetParent === null) continue;
+            const t = (el.innerText || el.textContent || '').trim();
+            if (t.length < 4 || t.length > 300) continue;
+            for (const m of t.matchAll(TLD_RE)) {
+                const u = cleanURL(m[0].startsWith('http') ? m[0] : 'https://' + m[0]);
+                if (isValidURL(u)) found.add(u);
+            }
+        }
+        for (const a of document.querySelectorAll('a[href]')){
+            const href = a.href || '';
+            if (isValidURL(href) && !href.includes('taplayma') && !href.includes('google.com/url')) found.add(href);
+        }
+        return [...found];
+    }
+
+    function fuzzyMatch(rawUrl) {
+        if (!rawUrl) return {url:rawUrl, matched:false, score:0};
+        const list = getList(); if(!list.length) return {url:rawUrl, matched:false, score:0};
+        const norm = u => u.toLowerCase().replace(/^https?:\/\/(www\.)?/, '').replace(/\/+$/, '');
+        const nr = norm(rawUrl);
+        for (const s of list) if (norm(s) === nr) return {url:s, matched:true, score:1};
+        let best = null, bScore = 0;
+        for (const s of list) {
+            const ns = norm(s);
+            if (ns.includes(nr) || nr.includes(ns)) {
+                const sc = Math.min(nr.length, ns.length) / Math.max(nr.length, ns.length);
+                if (sc >= 0.65 && sc > bScore) { bScore = sc; best = s; }
+            }
+        }
+        if (best) return {url:best, matched:true, score:bScore};
+        return {url:rawUrl, matched:false, score:0};
+    }
+
+    function showCandidates(urls) {
+        const cb = document.getElementById('ocr-cand-box-v42'); if (!cb) return;
+        if (!urls || urls.length <= 1) { cb.style.display = 'none'; return; }
+        cb.style.display = 'block';
+        cb.innerHTML = urls.slice(0, 6).map(u => `<div class="ocr-cand-v42" title="${u}" onclick="document.getElementById('ocr-url-box-v42').value='${u.replace(/'/g,"\\'")}'">  ${u}</div>`).join('');
+    }
+
+    // ─── URL EXTRACTOR TỪ RESPONSE AI ────────────────────────────────────
+    function extractURLFromAIText(rawText) {
+        if (!rawText) return '';
+        let text = rawText.trim();
+        const fullUrlRe = /https?:\/\/[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/gi;
+        const fullMatches = text.match(fullUrlRe);
+        if (fullMatches) { for (const m of fullMatches) { const c = cleanURL(m); if (isValidURL(c)) return c; } }
+        const wwwRe = new RegExp(`www\\.([a-zA-Z0-9\\-]{2,60}\\.(?:${TLD_PAT})(?:\\/[^\\s]*)?)`, 'gi');
+        const wwwMatches = text.match(wwwRe);
+        if (wwwMatches) { const c = cleanURL(wwwMatches[0]); if (isValidURL(c)) return c; }
+        const domainRe = new RegExp(`\\b([a-zA-Z0-9][a-zA-Z0-9\\-]{1,59}\\.(?:${TLD_PAT}))(?:[/\\s"'\`]|$)`, 'gi');
+        let dm; const domCandidates = [];
+        while ((dm = domainRe.exec(text)) !== null) { const c = cleanURL(dm[1]); if (isValidURL(c)) domCandidates.push(c); }
+        if (domCandidates.length > 0) { domCandidates.sort((a, b) => b.length - a.length); return domCandidates[0]; }
+        if (text.length < 80 && !text.includes(' ') && text.includes('.')) { const c = cleanURL(text.replace(/^["'`]|["'`]$/g, '')); if (isValidURL(c)) return c; }
+        const words = text.split(/[\s\n,;"'`()\[\]]+/);
+        for (const w of words) { if (w.includes('.') && w.length > 4) { const c = cleanURL(w); if (isValidURL(c)) return c; } }
+        return text;
+    }
+
+    // ─── TARGET IMAGE FINDER ──────────────────────────────────────────────
+    function findTargetImage() {
+        for (const img of document.querySelectorAll(TARGET_SELECTOR)) {
+            if (img.src && img.src.startsWith('http') && !img.src.includes('muabit') && !img.src.includes('zpi.cx') && (img.naturalWidth === 0 || img.naturalWidth > 10))
+                return img;
+        }
+        return null;
+    }
+
+    function fetchBase64(url) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method:'GET', url, responseType:'blob', timeout:25000,
+                onload: res => {
+                    if (res.status < 200 || res.status >= 300) { reject(new Error('HTTP '+res.status)); return; }
+                    const reader = new FileReader();
+                    reader.onloadend = () => { const dataUrl = reader.result; resolve({base64:dataUrl.split(',')[1], mime:(res.response.type||'image/jpeg').split(';')[0]}); };
+                    reader.onerror = () => reject(new Error('FileReader lỗi'));
+                    reader.readAsDataURL(res.response);
+                },
+                onerror:   () => reject(new Error('Không tải được ảnh')),
+                ontimeout: () => reject(new Error('Timeout tải ảnh'))
+            });
+        });
+    }
+
+    // ─── [FIX] GET VISION MODELS - lọc đúng, không loại Gemini ──────────
+    async function getVisionModels(setStatus) {
+        let dynamicModels = [];
+        try {
+            setStatus('📋 Fetch model list từ OpenRouter...', '#9b59b6');
+            dynamicModels = await new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method:'GET',
+                    url:'https://openrouter.ai/api/v1/models',
+                    headers:{'Authorization':`Bearer ${API_KEY}`, 'Content-Type':'application/json'},
+                    timeout:10000,
+                    onload: res => {
+                        try {
+                            const all = JSON.parse(res.responseText).data || [];
+                            const models = all.filter(m => {
+                                // Chỉ free
+                                const isFree = m.id.endsWith(':free') ||
+                                    (m.pricing && (m.pricing.prompt === '0' || m.pricing.prompt === 0) &&
+                                     (m.pricing.completion === '0' || m.pricing.completion === 0));
+                                // Loại CLIP / embed / text-to-image / music - không phải chat vision
+                                const notClip = !/clip|embed|text-to-image|t2i|diffusion|stable-diffusion|dall-e|lyria|music|audio/i.test(m.id);
+                                // Có image input
+                                const inputMods = m.architecture?.input_modalities || [];
+                                const hasImageInput = inputMods.includes('image');
+                                const hasVisionName = /vision|vl|flash|pixtral|qwen.*vl|llama.*vision|phi.*vision|phi.*multimodal|kimi-vl|ui-tars|moondream|bakllava|llava|minicpm.*v|internvl|gemini/i.test(m.id);
+                                return isFree && notClip && (hasImageInput || hasVisionName);
+                            }).map(m => m.id);
+                            resolve(models);
+                        } catch(e) { reject(e); }
+                    },
+                    onerror:   () => reject(new Error('Network error')),
+                    ontimeout: () => reject(new Error('Timeout'))
+                });
+            });
+            console.log('[AI URL] Dynamic models:', dynamicModels.length, dynamicModels);
+        } catch(err) {
+            console.warn('[AI URL] Không fetch được model list:', err.message);
+        }
+        // Hardcoded trước (ưu tiên), dynamic bổ sung, không trùng
+        const seen = new Set(HARDCODED_FREE_VISION_MODELS);
+        const extra = dynamicModels.filter(m => !seen.has(m));
+        const merged = [...HARDCODED_FREE_VISION_MODELS, ...extra];
+        setStatus(`📋 ${merged.length} model (${extra.length} dynamic + ${HARDCODED_FREE_VISION_MODELS.length} hardcode)`, '#9b59b6');
+        return merged;
+    }
+
+    // ─── GỌI AI MODEL ─────────────────────────────────────────────────────
+    function callAIModel(base64, mime, model) {
+        const PROMPT = `Look at this image carefully. Find any website URL, domain name, or web address shown in the image.
+Output ONLY the domain or URL with no explanation, no punctuation, no quotes.
+Examples of good output: hitclub.si | www.abc88.com | https://xyz.net
+If no URL found, output: NONE`;
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method:'POST',
+                url:'https://openrouter.ai/api/v1/chat/completions',
+                headers:{
+                    'Content-Type':'application/json',
+                    'Authorization':`Bearer ${API_KEY}`,
+                    'HTTP-Referer':'https://tampermonkey.net',
+                    'X-Title':'AI URL Scanner v43'
+                },
+                data: JSON.stringify({
+                    model,
+                    messages:[{role:'user',content:[
+                        {type:'image_url',image_url:{url:`data:${mime};base64,${base64}`,detail:'high'}},
+                        {type:'text',text:PROMPT}
+                    ]}],
+                    max_tokens: 120,
+                    temperature: 0,
+                    top_p: 1
+                }),
+                timeout: 45000,
+                onload: res => {
+                    let data;
+                    try { data = JSON.parse(res.responseText); }
+                    catch(e) { reject(new Error('JSON parse lỗi: '+res.responseText.substring(0,100))); return; }
+                    if (data.error) {
+                        const errMsg = typeof data.error === 'object' ? (data.error.message || JSON.stringify(data.error)) : String(data.error);
+                        if (errMsg.includes('rate') || errMsg.includes('429') || errMsg.includes('quota')) reject(new Error('RATE_LIMIT: ' + errMsg));
+                        else reject(new Error(errMsg));
+                        return;
+                    }
+                    if (res.status < 200 || res.status >= 300) { reject(new Error('HTTP ' + res.status)); return; }
+                    const text = data?.choices?.[0]?.message?.content?.trim();
+                    if (!text || text.toUpperCase() === 'NONE' || text.length < 2) { reject(new Error('Phản hồi rỗng hoặc NONE')); return; }
+                    const extracted = extractURLFromAIText(text);
+                    const usedModel = data?.model || model;
+                    console.log(`[AI URL][${model.split('/').pop()}] Raw: "${text}" → Extracted: "${extracted}"`);
+                    if (!extracted || extracted.length < 4) { reject(new Error('Không extract được URL từ: ' + text.substring(0, 60))); return; }
+                    resolve({text: extracted, rawText: text, usedModel});
+                },
+                onerror:   () => reject(new Error('Mất kết nối')),
+                ontimeout: () => reject(new Error('Timeout 45s'))
+            });
+        });
+    }
+
+    async function tryAIModels(base64, mime, models, setStatus) {
+        const errors = [];
+        for (let i = 0; i < models.length; i++) {
+            const model = models[i];
+            const shortName = model.split('/').pop().replace(':free','');
+            setStatus(`🤖 [${i+1}/${models.length}] ${shortName}`, '#3498db');
+            try {
+                const result = await callAIModel(base64, mime, model);
+                if (result.text && result.text.length > 3 && !result.text.includes('NONE')) return result;
+                errors.push(`${shortName}: kết quả không hợp lệ "${result.text}"`);
+            } catch(err) {
+                const errMsg = err.message || String(err);
+                errors.push(`${shortName}: ${errMsg}`);
+                console.warn(`[AI URL][SKIP] ${model}: ${errMsg}`);
+                if (i < models.length - 1) {
+                    setStatus(`⏩ Skip ${shortName} → thử tiếp...`, '#f39c12');
+                    await sleep(errMsg.includes('RATE_LIMIT') ? 200 : 300);
+                }
+            }
+        }
+        throw new Error(`Đã thử ${models.length} model.\nLỗi cuối: ${errors.slice(-3).join(' | ')}`);
+    }
+
+    // ─── XÓA QUẢNG CÁO ───────────────────────────────────────────────────
+    function removeAds() {
+        try {
+            document.querySelectorAll('div[data-v-f897f214].mb-6.text-center').forEach(div => { if (div.querySelector('a[href*="muabit.com"]')) div.remove(); });
+            document.querySelectorAll('a[href*="muabit.com"], a[href*="zpi.cx"]').forEach(a => {
+                let node = a;
+                for (let i = 0; i < 4; i++) {
+                    const parent = node.parentElement;
+                    if (!parent || parent === document.body) break;
+                    if (parent.children.length <= 3) node = parent; else break;
+                }
+                node.remove();
+            });
+        } catch(e) {}
+    }
+
+    // ─── MAIN AI SCAN ─────────────────────────────────────────────────────
+    async function runAIScan(setStatus, urlBox) {
+        if (window._ocrUI) { window._ocrUI.lastScannedImgKey = null; window._ocrUI.lastScannedImgSrc = null; }
+        setStatus('🧹 Xóa quảng cáo...', '#f1c40f');
+        removeAds();
+        await sleep(400);
+
+        const metaURLs = scanPageMetaURLs();
+        if (metaURLs.length) {
+            urlBox.value = metaURLs[0];
+            setStatus('✅ Meta/OG: ' + metaURLs[0], 'ok');
+            window.open('https://www.google.com/url?q=' + encodeURIComponent(metaURLs[0]), TAB_NAME);
+            showCandidates(metaURLs); return;
+        }
+
+        const domURLs = quickScanDOMForURL().filter(u => !u.includes('taplayma') && !u.includes('google.com/url'));
+        if (domURLs.length) {
+            const m = fuzzyMatch(domURLs[0]);
+            urlBox.value = m.url || domURLs[0];
+            setStatus('✅ DOM: ' + domURLs.length + ' URL tìm thấy', 'ok');
+            window.open('https://www.google.com/url?q=' + encodeURIComponent(m.url || domURLs[0]), TAB_NAME);
+            showCandidates(domURLs); return;
+        }
+
+        for (const img of document.images) {
+            const cached = lookupImgURL(img.src);
+            if (cached) {
+                const m = fuzzyMatch(cached);
+                urlBox.value = m.url || cached;
+                if (window._ocrUI) {
+                    window._ocrUI.selectedImgKey = normKey(img.src);
+                    window._ocrUI.lastScannedImgKey = normKey(img.src);
+                    window._ocrUI.lastScannedImgSrc = img.src;
+                }
+                setStatus('✅ Cache hit!', 'ok');
+                window.open('https://www.google.com/url?q=' + encodeURIComponent(m.url || cached), TAB_NAME);
+                return;
+            }
+        }
+
+        setStatus('🔍 Tìm ảnh target...', '#f1c40f');
+        await sleep(1000);
+        const img = findTargetImage();
+        if (!img) { setStatus('❌ Không tìm thấy ảnh target. Thử AI Scan lại!', '#e74c3c'); return; }
+        const imgSrc = img.src;
+        if (window._ocrUI) { window._ocrUI.lastScannedImgSrc = imgSrc; window._ocrUI.lastScannedImgKey = normKey(imgSrc); }
+        console.log('[AI URL] Ảnh target:', imgSrc);
+
+        setStatus('📥 Tải ảnh...', '#f1c40f');
+        let imgData;
+        try {
+            imgData = await fetchBase64(imgSrc);
+            setStatus(`📥 Ảnh OK (${imgData.mime})`, '#f1c40f');
+        } catch(err) { setStatus('❌ Lỗi tải ảnh: ' + err.message, '#e74c3c'); return; }
+
+        let models;
+        try {
+            models = await getVisionModels(setStatus);
+            await sleep(200);
+        } catch(err) {
+            models = [...HARDCODED_FREE_VISION_MODELS];
+            setStatus(`⚠️ Dùng ${models.length} model hardcode...`, '#f39c12');
+        }
+
+        try {
+            const { text, rawText, usedModel } = await tryAIModels(imgData.base64, imgData.mime, models, setStatus);
+            const isValid = isValidURL(text.startsWith('http') ? text : 'https://'+text);
+            let finalURL = isValid ? cleanURL(text) : text;
+            const matched = fuzzyMatch(finalURL);
+            if (matched.matched) finalURL = matched.url;
+            urlBox.value = finalURL;
+            if (imgSrc) { saveImgURL(imgSrc, finalURL, 1); if (window._ocrUI) window._ocrUI.selectedImgKey = normKey(imgSrc); }
+            const modelShort = usedModel.split('/').pop().replace(':free','');
+            const matchInfo = matched.matched ? `Matched ${Math.round(matched.score*100)}%` : `Model: ${modelShort}`;
+            setStatus(`${isValid?'✅':'⚠️'} ${matchInfo} → ${finalURL}`, 'ok');
+            window.open('https://www.google.com/url?q=' + encodeURIComponent(finalURL), TAB_NAME);
+            console.log('[AI URL] Result:', {finalURL, rawText, usedModel, isValid, matched});
+        } catch(err) {
+            setStatus('❌ AI lỗi: ' + err.message, '#e74c3c');
+            console.error('[AI URL] Scan thất bại:', err);
+        }
+    }
+
+    // ─── COUNTDOWN WATCHER ────────────────────────────────────────────────
+    function startCountdownWatcher() {
+        let overlayEl = null;
+        const getOrCreate = () => {
+            if (overlayEl && document.body.contains(overlayEl)) return overlayEl;
+            overlayEl = document.createElement('div');
+            overlayEl.id = 'ocr-countdown-v42';
+            overlayEl.style.cssText = 'position:fixed;bottom:16px;right:16px;background:linear-gradient(135deg,#0d0d12,#13131c);border:1px solid rgba(255,45,120,.4);border-radius:12px;padding:10px 20px;font-family:"Orbitron",monospace;font-size:24px;font-weight:900;color:#ff2d78;z-index:9999998;box-shadow:0 0 30px rgba(255,45,120,.25),inset 0 1px 0 rgba(255,45,120,.1);text-align:center;min-width:100px;display:none;text-shadow:0 0 15px rgba(255,45,120,.8);letter-spacing:2px;';
+            document.body.appendChild(overlayEl);
+            return overlayEl;
+        };
+        const tick = () => {
+            const endStr = localStorage.getItem(COUNTDOWN_KEY);
+            const ov = getOrCreate();
+            if (!endStr) { ov.style.display = 'none'; setTimeout(tick, 500); return; }
+            const remaining = Math.ceil((parseInt(endStr) - Date.now()) / 1000);
+            if (remaining <= 0) { localStorage.removeItem(COUNTDOWN_KEY); ov.style.display = 'none'; setTimeout(tick, 500); return; }
+            ov.style.display = 'block'; ov.textContent = remaining + 's';
+            setTimeout(tick, 300);
+        };
+        tick();
+    }
+
+    // ─── CAPTCHA WATCHER ──────────────────────────────────────────────────
+    function startCaptchaWatcher(setStatus, autoBar) {
+        let watching = false, solved = false, solvedTimer = null;
+        const log = (msg, type) => { if (setStatus) setStatus(msg, type||'ok'); if (autoBar) autoBar.textContent = msg; };
+        const PRESENT_SEL = ['iframe[src*="hcaptcha.com"]','.h-captcha','iframe[src*="recaptcha"]','.g-recaptcha','iframe[src*="challenges.cloudflare.com"]','.cf-turnstile'].join(',');
+        function isSolved() {
+            for (const s of ['textarea[id^="h-captcha-response"]','textarea[name="h-captcha-response"]','textarea[id^="g-recaptcha-response"]','textarea[name="g-recaptcha-response"]']) {
+                const el = document.querySelector(s); if (el && el.value && el.value.length > 10) return true;
+            }
+            for (const s of ['input[name="cf-turnstile-response"]','input[name="cf_turnstile_response"]']) {
+                const el = document.querySelector(s); if (el && el.value && el.value.length > 10) return true;
+            }
+            return false;
+        }
+        async function onSolved() {
+            if (solved) return; solved = true; log('Captcha solved!');
+            await sleep(700); const btn1 = findConfirmBtn();
+            if (btn1) { simClick(btn1); log('Click OK'); } else log('Không thấy nút xác nhận', 'err');
+            await sleep(900); const sub = await waitForElement('#submit-button', 15000);
+            if (sub) { await sleep(400); simClick(sub); log('Hoàn tất!', 'ok'); if (autoBar) autoBar.style.display = 'none'; }
+            else log('Không thấy #submit-button', 'err');
+        }
+        function startWatching() {
+            if (watching) return; watching = true; solved = false; log('Chờ giải captcha...');
+            const iv = setInterval(() => {
+                if (isSolved()) { clearInterval(iv); watching = false; if (solvedTimer) clearTimeout(solvedTimer); solvedTimer = setTimeout(() => onSolved(), 300); }
+            }, 600);
+            setTimeout(() => { clearInterval(iv); watching = false; }, 300000);
+        }
+        const obs = new MutationObserver(() => {
+            const has = !!document.querySelector(PRESENT_SEL);
+            if (has) startWatching();
+            else if (!has && watching) { watching = false; solved = false; if (solvedTimer) { clearTimeout(solvedTimer); solvedTimer = null; } }
+        });
+        obs.observe(document.body, {childList:true, subtree:true, attributes:true});
+        if (document.querySelector(PRESENT_SEL)) startWatching();
+    }
+
+    // ─── UI ───────────────────────────────────────────────────────────────
+    function createUI() {
+        const fontLink = document.createElement('link');
+        fontLink.rel = 'stylesheet';
+        fontLink.href = 'https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Share+Tech+Mono&family=Rajdhani:wght@500;700&display=swap';
+        document.head.appendChild(fontLink);
+
+        GM_addStyle(`
+        #ocr-shell-v42 *, #ocr-shell-v42 *::before, #ocr-shell-v42 *::after { box-sizing:border-box; }
+        #ocr-shell-v42 {
+            --c1:#00e5ff; --c2:#ff2d78; --c3:#7c3aed; --c4:#00e676;
+            --bg0:#07070f; --bg1:#0d0d1a; --bg2:#12121f; --bg3:#1a1a2e;
+            --border:rgba(0,229,255,.14); --shadow:0 8px 32px rgba(0,0,0,.7),0 0 0 1px rgba(0,229,255,.06);
+            position:fixed; top:55px; right:12px; width:230px;
+            background:var(--bg0); border:1px solid var(--border); border-radius:14px;
+            z-index:999999; overflow:hidden; box-shadow:var(--shadow);
+            transition:width .22s cubic-bezier(.4,0,.2,1); min-width:140px;
+            font-family:'Rajdhani',sans-serif; backdrop-filter:blur(12px);
+        }
+        #ocr-shell-v42::before { content:''; position:absolute; left:0; right:0; top:-100%; height:2px;
+            background:linear-gradient(90deg,transparent,var(--c1),transparent); opacity:.35;
+            animation:scanV42 4s ease-in-out infinite; pointer-events:none; z-index:1000; }
+        @keyframes scanV42 { 0%{top:-5px;opacity:0} 5%{opacity:.35} 95%{opacity:.35} 100%{top:105%;opacity:0} }
+        #ocr-hdr-v42 { display:flex; align-items:center; justify-content:space-between; padding:8px 10px 7px;
+            background:linear-gradient(90deg,rgba(0,229,255,.06),rgba(124,58,237,.06),rgba(255,45,120,.06));
+            border-bottom:1px solid var(--border); cursor:move; user-select:none; touch-action:none; position:relative; z-index:10; }
+        #ocr-logo-v42 { display:flex; align-items:center; gap:7px; }
+        .ocr-pulse-v42 { width:6px; height:6px; border-radius:50%; background:var(--c1);
+            box-shadow:0 0 8px var(--c1),0 0 16px rgba(0,229,255,.4); animation:pulseV42 1.8s ease-in-out infinite; }
+        @keyframes pulseV42 { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.35;transform:scale(.6)} }
+        #ocr-title-v42 { font-family:'Orbitron',monospace; font-size:8px; font-weight:700; color:var(--c1); letter-spacing:2px; text-shadow:0 0 10px rgba(0,229,255,.5); }
+        #ocr-ver-v42   { font-family:'Share Tech Mono',monospace; font-size:7px; color:rgba(255,45,120,.7); letter-spacing:1px; }
+        .ocr-hdr-right-v42 { display:flex; align-items:center; gap:4px; }
+        .ocr-sz-v42 { background:var(--bg3); border:1px solid rgba(0,229,255,.1); border-radius:4px; color:#444; width:18px; height:18px; font-size:8px; font-weight:700; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:all .15s; font-family:'Orbitron',monospace; }
+        .ocr-sz-v42:hover, .ocr-sz-v42.active { background:rgba(0,229,255,.12); color:var(--c1); border-color:rgba(0,229,255,.35); }
+        #ocr-close-v42 { background:var(--bg3); border:1px solid rgba(255,45,120,.15); border-radius:4px; color:#555; width:18px; height:18px; font-size:9px; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:all .15s; }
+        #ocr-close-v42:hover { background:rgba(255,45,120,.15); color:var(--c2); }
+        #ocr-body-v42 { padding:8px 9px 7px; display:flex; flex-direction:column; gap:6px; position:relative; z-index:10; }
+        .ocr-lbl-v42 { font-family:'Share Tech Mono',monospace; font-size:7px; color:rgba(0,229,255,.4); letter-spacing:2px; text-transform:uppercase; margin-bottom:2px; }
+        #ocr-shell-v42 input[type=text] { width:100%; background:var(--bg2); border:1px solid rgba(0,229,255,.1); border-radius:6px; color:var(--c1); font-family:'Share Tech Mono',monospace; font-size:9.5px; padding:5px 7px; outline:none; transition:border-color .2s,box-shadow .2s; }
+        #ocr-shell-v42 input[type=text]:focus { border-color:rgba(0,229,255,.35); box-shadow:0 0 0 2px rgba(0,229,255,.07); }
+        #ocr-ai-status-v42 { background:rgba(0,229,255,.04); border:1px solid rgba(0,229,255,.12); border-radius:8px; padding:7px 9px; font-family:'Share Tech Mono',monospace; font-size:8px; color:#555; min-height:24px; word-break:break-all; display:none; }
+        #ocr-ai-status-v42.active { display:block; color:var(--c1); }
+        #ocr-ai-status-v42.ok  { display:block; color:var(--c4); }
+        #ocr-ai-status-v42.err { display:block; color:var(--c2); }
+        .ocr-btn-row-v42 { display:flex; gap:5px; }
+        .ocr-btn-v42 { flex:1; padding:6px 0; border-radius:7px; border:1px solid transparent; font-family:'Orbitron',monospace; font-weight:700; font-size:8px; letter-spacing:1px; cursor:pointer; transition:all .18s; }
+        .ocr-btn-v42:active { transform:scale(.96); }
+        .ocr-btn-v42:hover  { filter:brightness(1.15); }
+        #ocr-btn-imgs-v42 { background:linear-gradient(135deg,#1a237e,#1565c0); color:#90caf9; border-color:rgba(66,165,245,.25); box-shadow:0 2px 12px rgba(21,101,192,.3); }
+        #ocr-btn-ocr-v42  { background:linear-gradient(135deg,#7c3aed,#4f46e5); color:#c4b5fd; border-color:rgba(124,58,237,.3); box-shadow:0 2px 12px rgba(124,58,237,.3); }
+        #ocr-btn-open-v42 { background:linear-gradient(135deg,#ff2d78,#e11d48); color:#fff; border-color:rgba(255,45,120,.3); box-shadow:0 2px 12px rgba(255,45,120,.3); }
+        .ocr-io-row-v42 { display:flex; gap:5px; }
+        .ocr-io-btn-v42 { flex:1; padding:4px 0; border-radius:6px; font-family:'Share Tech Mono',monospace; font-size:9px; cursor:pointer; transition:all .18s; display:flex; align-items:center; justify-content:center; gap:3px; }
+        #ocr-btn-export-v42 { background:linear-gradient(135deg,rgba(26,35,126,.7),rgba(40,53,147,.7)); color:#90caf9; border:1px solid rgba(66,165,245,.2); }
+        #ocr-btn-import-v42 { background:linear-gradient(135deg,rgba(27,94,32,.7),rgba(46,125,50,.7)); color:#a5d6a7; border:1px solid rgba(102,187,106,.2); }
+        .ocr-scroll-v42 { max-height:110px; overflow-y:auto; background:var(--bg2); border:1px solid var(--border); border-radius:7px; padding:4px 5px; scrollbar-width:thin; scrollbar-color:rgba(0,229,255,.3) transparent; }
+        #ocr-imglist-v42 { display:none; }
+        .ocr-img-row-v42 { background:var(--bg3); border:1px solid rgba(0,229,255,.08); border-radius:6px; padding:5px 6px; margin-bottom:4px; }
+        .ocr-img-url-input-v42 { width:100%; background:rgba(0,0,0,.3); border:1px solid rgba(0,229,255,.15); border-radius:4px; color:var(--c1); font-family:'Share Tech Mono',monospace; font-size:8.5px; padding:3px 5px; margin:3px 0; outline:none; }
+        .ocr-img-btn-row-v42 { display:flex; gap:3px; margin-top:3px; }
+        .ocr-img-btn-v42 { flex:1; background:rgba(0,229,255,.06); border:1px solid rgba(0,229,255,.15); border-radius:4px; color:var(--c1); font-size:7.5px; padding:2px 0; cursor:pointer; font-family:'Share Tech Mono',monospace; transition:all .15s; }
+        .ocr-img-btn-del-v42 { background:rgba(255,45,120,.06); border-color:rgba(255,45,120,.15); color:var(--c2); }
+        .ocr-clr-btn-v42 { width:100%; margin-top:4px; background:rgba(255,45,120,.05); border:1px solid rgba(255,45,120,.15); border-radius:5px; color:var(--c2); font-family:'Orbitron',monospace; font-weight:700; font-size:8px; padding:4px; cursor:pointer; letter-spacing:1px; }
+        #ocr-cand-box-v42 { display:none; max-height:56px; overflow-y:auto; background:var(--bg2); border:1px solid rgba(0,229,255,.1); border-radius:6px; padding:3px 5px; }
+        .ocr-cand-v42 { font-family:'Share Tech Mono',monospace; font-size:8px; color:#555; cursor:pointer; padding:2px 0; border-bottom:1px solid rgba(255,255,255,.03); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .ocr-cand-v42:hover { color:var(--c1); }
+        #ocr-status-v42 { font-family:'Share Tech Mono',monospace; font-size:8px; color:#444; text-align:center; min-height:14px; word-break:break-all; padding:0 2px; transition:color .2s; }
+        #ocr-status-v42.ok  { color:var(--c4); text-shadow:0 0 8px rgba(0,230,118,.25); }
+        #ocr-status-v42.err { color:var(--c2); }
+        #ocr-cache-v42 { display:none; background:rgba(0,230,118,.07); border:1px solid rgba(0,230,118,.2); border-radius:6px; padding:4px 7px; font-family:'Share Tech Mono',monospace; font-size:7.5px; color:var(--c4); text-align:center; }
+        #ocr-autobar-v42 { display:none; background:linear-gradient(90deg,rgba(0,229,255,.05),rgba(124,58,237,.05)); border-top:1px solid var(--border); padding:5px 10px; font-family:'Share Tech Mono',monospace; font-size:7.5px; color:var(--c1); text-align:center; letter-spacing:.8px; }
+        #ocr-shell-v42.sz-s { width:160px; }
+        #ocr-shell-v42.sz-l { width:340px; }
+        .ocr-divider-v42 { height:1px; background:linear-gradient(90deg,transparent,rgba(0,229,255,.12),transparent); margin:1px 0; }
+        @keyframes foundGlowV42 { 0%,100%{box-shadow:var(--shadow)} 50%{box-shadow:0 8px 40px rgba(0,0,0,.8),0 0 0 1px rgba(0,230,118,.3),0 0 30px rgba(0,230,118,.1)} }
+        #ocr-shell-v42.found-v42 { animation:foundGlowV42 1.5s ease-in-out 3; }
+        `);
+
+        const shell = document.createElement('div');
+        shell.id = 'ocr-shell-v42';
+        shell.innerHTML = `
+        <div id="ocr-hdr-v42">
+            <div id="ocr-logo-v42">
+                <div class="ocr-pulse-v42"></div>
+                <div><div id="ocr-title-v42">TAPLAYMA</div><div id="ocr-ver-v42">AI VISION v43.1</div></div>
+            </div>
+            <div class="ocr-hdr-right-v42">
+                <button class="ocr-sz-v42" data-sz="s">S</button>
+                <button class="ocr-sz-v42 active" data-sz="m">M</button>
+                <button class="ocr-sz-v42" data-sz="l">L</button>
+                <button id="ocr-close-v42">X</button>
+            </div>
+        </div>
+        <div id="ocr-body-v42">
+            <div id="ocr-cache-v42">URL có sẵn (cache) – nhấn OPEN</div>
+            <div>
+                <div class="ocr-lbl-v42">URL</div>
+                <input id="ocr-url-box-v42" type="text" placeholder="https://..."/>
+            </div>
+            <div id="ocr-ai-status-v42">Sẵn sàng quét AI...</div>
+            <div id="ocr-cand-box-v42"></div>
+            <div class="ocr-btn-row-v42">
+                <button id="ocr-btn-imgs-v42" class="ocr-btn-v42">IMGS</button>
+                <button id="ocr-btn-ocr-v42"  class="ocr-btn-v42">AI SCAN</button>
+                <button id="ocr-btn-open-v42" class="ocr-btn-v42">OPEN</button>
+            </div>
+            <div class="ocr-divider-v42"></div>
+            <div class="ocr-io-row-v42">
+                <button id="ocr-btn-export-v42" class="ocr-io-btn-v42">Xuất</button>
+                <button id="ocr-btn-import-v42" class="ocr-io-btn-v42">Nhập</button>
+                <input id="ocr-import-file-v42" type="file" accept=".json" style="display:none">
+            </div>
+            <div id="ocr-imglist-v42" class="ocr-scroll-v42"></div>
+            <div id="ocr-status-v42"></div>
+        </div>
+        <div id="ocr-autobar-v42">Đang chờ code từ tab phụ...</div>`;
+        document.body.appendChild(shell);
+
+        const statusEl   = shell.querySelector('#ocr-status-v42');
+        const aiStatusEl = shell.querySelector('#ocr-ai-status-v42');
+        const urlBox     = shell.querySelector('#ocr-url-box-v42');
+        const imgListBox = shell.querySelector('#ocr-imglist-v42');
+        const autoBar    = shell.querySelector('#ocr-autobar-v42');
+        const cacheBadge = shell.querySelector('#ocr-cache-v42');
+        const importFile = shell.querySelector('#ocr-import-file-v42');
+
+        const setStatus = (msg, type = '') => {
+            statusEl.textContent = msg; statusEl.className = type;
+            aiStatusEl.textContent = msg; aiStatusEl.className = type ? `active ${type}` : 'active';
+            if (type === 'ok') { shell.classList.add('found-v42'); setTimeout(() => shell.classList.remove('found-v42'), 4500); }
+        };
+
+        window._ocrUI = { urlBox, autoBar, setStatus, selectedImgKey: null, lastScannedImgKey: null, lastScannedImgSrc: null };
+
+        shell.querySelectorAll('.ocr-sz-v42').forEach(b => {
+            b.onclick = () => {
+                const sz = b.dataset.sz;
+                shell.style.width = (sz === 's' ? 160 : sz === 'l' ? 340 : 230) + 'px';
+                shell.className = 'sz-' + sz;
+                shell.querySelectorAll('.ocr-sz-v42').forEach(x => x.classList.toggle('active', x.dataset.sz === sz));
+            };
+        });
+        shell.querySelector('#ocr-close-v42').onclick = () => shell.remove();
+
+        let drag = false, ox = 0, oy = 0;
+        const hdr = shell.querySelector('#ocr-hdr-v42');
+        hdr.onmousedown = e => { drag = true; ox = e.clientX - shell.offsetLeft; oy = e.clientY - shell.offsetTop; };
+        hdr.addEventListener('touchstart', e => { const t = e.touches[0]; drag = true; ox = t.clientX - shell.offsetLeft; oy = t.clientY - shell.offsetTop; }, {passive:true});
+        document.addEventListener('mouseup', () => drag = false);
+        document.addEventListener('touchend', () => drag = false);
+        document.addEventListener('mousemove', e => { if (!drag) return; shell.style.left = e.clientX - ox + 'px'; shell.style.top = e.clientY - oy + 'px'; shell.style.right = 'auto'; });
+        document.addEventListener('touchmove', e => { if (!drag) return; const t = e.touches[0]; shell.style.left = t.clientX - ox + 'px'; shell.style.top = t.clientY - oy + 'px'; shell.style.right = 'auto'; }, {passive:true});
+
+        shell.querySelector('#ocr-btn-imgs-v42').onclick = () => {
+            const visible = imgListBox.style.display === 'block';
+            imgListBox.style.display = visible ? 'none' : 'block';
+            if (!visible) renderImgList();
+        };
+
+        function renderImgList() {
+            const m = getImgMap(), keys = Object.keys(m);
+            if (!keys.length) { imgListBox.innerHTML = '<div style="color:#555;font-size:9px;text-align:center;padding:6px;font-family:Share Tech Mono,monospace">Chưa có ảnh nào</div>'; return; }
+            keys.sort((a, b) => (m[b].lastSeen || 0) - (m[a].lastSeen || 0));
+            imgListBox.innerHTML = keys.map(k => {
+                const entry = m[k], name = k.split('/').pop().substring(0, 22);
+                const ek = k.replace(/"/g, '&quot;').replace(/'/g, "\\'");
+                return `<div class="ocr-img-row-v42">
+                    <div style="display:flex;justify-content:space-between;margin-bottom:2px">
+                        <span style="color:#555;font-size:7.5px;font-family:'Share Tech Mono',monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:80%">${name}</span>
+                        <span style="color:#333;font-size:7px;font-family:'Share Tech Mono',monospace">${entry.count || 1}x</span>
+                    </div>
+                    <input type="text" class="ocr-img-url-input-v42" value="${entry.url.replace(/"/g,'&quot;')}" placeholder="URL...">
+                    <div class="ocr-img-btn-row-v42">
+                        <button class="ocr-img-btn-v42" onclick="(function(){var r=this.closest('.ocr-img-row-v42');var i=r.querySelector('.ocr-img-url-input-v42');document.getElementById('ocr-url-box-v42').value=i.value;window._ocrUI.selectedImgKey='${ek}';}).call(this)">Dùng</button>
+                        <button class="ocr-img-btn-v42" onclick="(function(){var r=this.closest('.ocr-img-row-v42');var i=r.querySelector('.ocr-img-url-input-v42');var mm=JSON.parse(localStorage.getItem('${IMG_MAP_KEY}')||'{}');if(mm['${ek}']){mm['${ek}'].url=i.value.trim();mm['${ek}'].lastSeen=Date.now();localStorage.setItem('${IMG_MAP_KEY}',JSON.stringify(mm));}}).call(this)">Lưu</button>
+                        <button class="ocr-img-btn-del-v42 ocr-img-btn-v42" onclick="(function(){var mm=JSON.parse(localStorage.getItem('${IMG_MAP_KEY}')||'{}');delete mm['${ek}'];localStorage.setItem('${IMG_MAP_KEY}',JSON.stringify(mm));if(window._ocrUI.selectedImgKey==='${ek}')window._ocrUI.selectedImgKey=null;this.closest('.ocr-img-row-v42').remove();}).call(this)">X</button>
+                    </div></div>`;
+            }).join('') + `<button class="ocr-clr-btn-v42" onclick="localStorage.removeItem('${IMG_MAP_KEY}');window._ocrUI.selectedImgKey=null;document.getElementById('ocr-imglist-v42').innerHTML='<div style=color:#555;font-size:9px;text-align:center;padding:6px>Đã xóa</div>'">XÓA TẤT CẢ</button>`;
+        }
+
+        shell.querySelector('#ocr-btn-ocr-v42').onclick = async () => {
+            imgListBox.style.display = 'none';
+            shell.querySelector('#ocr-cand-box-v42').style.display = 'none';
+            cacheBadge.style.display = 'none';
+            setStatus('🔄 Bắt đầu AI Scan...', '');
+            await runAIScan(setStatus, urlBox);
+        };
+
+        shell.querySelector('#ocr-btn-open-v42').onclick = () => {
+            let url = urlBox.value.trim();
+            if (!url) { setStatus('Nhập URL trước!', 'err'); return; }
+            if (!url.startsWith('http')) url = 'https://' + url;
+            let saved = false;
+            if (window._ocrUI.selectedImgKey) {
+                const mm = getImgMap(), key = window._ocrUI.selectedImgKey;
+                if (mm[key] && mm[key].url !== url) { mm[key].url = url; mm[key].lastSeen = Date.now(); saveImgMap(mm); if (imgListBox.style.display === 'block') renderImgList(); saved = true; }
+            } else if (window._ocrUI.lastScannedImgKey && window._ocrUI.lastScannedImgSrc) {
+                const mm = getImgMap(), key = window._ocrUI.lastScannedImgKey;
+                if (!mm[key] || mm[key].url !== url) { saveImgURL(window._ocrUI.lastScannedImgSrc, url, 1); window._ocrUI.selectedImgKey = key; saved = true; }
+            }
+            setStatus(saved ? 'Saved & opened!' : 'Opened!', 'ok');
+            addURL(url);
+            window.open('https://www.google.com/url?q=' + encodeURIComponent(url), TAB_NAME);
+            autoBar.style.display = 'block'; autoBar.textContent = 'Chờ code từ tab phụ...';
+        };
+
+        shell.querySelector('#ocr-btn-export-v42').onclick = () => { try { exportData(); setStatus('Đã xuất file', 'ok'); } catch(e) { setStatus('Lỗi: '+e.message, 'err'); } };
+        shell.querySelector('#ocr-btn-import-v42').onclick = () => { importFile.value=''; importFile.click(); };
+        importFile.onchange = () => {
+            const file = importFile.files[0]; if (!file) return;
+            setStatus('Đang nhập...', '');
+            importData(file, (msg, type) => { setStatus(msg, type); if(imgListBox.style.display==='block') renderImgList(); });
+        };
+
+        startCodeListener(setStatus, autoBar);
+        startCaptchaWatcher(setStatus, autoBar);
+        startCountdownWatcher();
+
+        setTimeout(async () => {
+            const ui = window._ocrUI; if (!ui) return;
+            for (const img of document.images) {
+                const cached = lookupImgURL(img.src);
+                if (cached) {
+                    ui.urlBox.value = cached;
+                    ui.selectedImgKey = normKey(img.src);
+                    ui.lastScannedImgKey = normKey(img.src);
+                    ui.lastScannedImgSrc = img.src;
+                    cacheBadge.style.display = 'block';
+                    window.open('https://www.google.com/url?q=' + encodeURIComponent(cached), TAB_NAME);
+                    return;
+                }
+            }
+            await runAIScan(setStatus, ui.urlBox);
+        }, 2500);
+    }
+
+    // ─── CODE LISTENER ────────────────────────────────────────────────────
+    function startCodeListener(setStatus, autoBar) {
+        localStorage.removeItem(CODE_KEY);
+        window.addEventListener('storage', async e => {
+            if (e.key !== CODE_KEY || !e.newValue) return;
+            const code = e.newValue; localStorage.removeItem(CODE_KEY);
+            if (autoBar) { autoBar.style.display='block'; autoBar.textContent=`Code: ${code}`; }
+            if (setStatus) setStatus(`Code: ${code}`, 'ok');
+            await autoFillCode(code, setStatus, autoBar);
+        });
+        window.addEventListener('message', e => {
+            if (!e.data || e.data.type !== 'OCR_CODE' || !e.data.code) return;
+            const code = e.data.code;
+            localStorage.setItem(CODE_KEY, code);
+            window.dispatchEvent(new StorageEvent('storage', {key:CODE_KEY, newValue:code, storageArea:localStorage}));
+        });
+    }
+
+    async function autoFillCode(code, setStatus, autoBar) {
+        const log = (msg, type) => { if(setStatus)setStatus(msg,type||'ok'); if(autoBar)autoBar.textContent=msg; };
+        log('Đang điền mã...');
+        const inp = findCodeInput();
+        if (!inp) { log('Không tìm thấy ô mã', 'err'); return; }
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(inp, code);
+        ['input','change'].forEach(ev => inp.dispatchEvent(new Event(ev, {bubbles:true})));
+        inp.focus(); log(`Đã điền: ${code}`);
+        await sleep(1500); log('Click Xác Nhận...');
+        const btn1 = findConfirmBtn();
+        if (btn1) { simClick(btn1); log('Click OK'); } else log('Không thấy nút xác nhận', 'err');
+        await sleep(1200);
+        const captchaEl = document.querySelector('iframe[src*="hcaptcha"],iframe[src*="recaptcha"],iframe[src*="challenges.cloudflare.com"],.h-captcha,.g-recaptcha,.cf-turnstile');
+        if (!captchaEl) {
+            await sleep(2500);
+            const errEl = document.querySelector('.link-alert-error,.alert-error,[class*="error"]');
+            if (errEl && errEl.offsetParent !== null) {
+                const t = (errEl.innerText||errEl.textContent||'').toLowerCase();
+                if (t.includes('khong dung')||t.includes('sai')||t.includes('invalid')||t.includes('incorrect')) { log('Mã sai! Kiểm tra lại', 'err'); return; }
+            }
+            log('Chờ nút Tiếp Tục...');
+            const sub = await waitForElement('#submit-button', 15000);
+            if (sub) { await sleep(400); simClick(sub); log('Hoàn tất!', 'ok'); if(autoBar)autoBar.style.display='none'; }
+            else log('Không thấy #submit-button', 'err');
+        } else log('Chờ giải captcha...');
+    }
+
+    function waitForElement(selector, timeout=10000) {
+        return new Promise(resolve => {
+            const check = () => { const el=document.querySelector(selector); if(el&&el.offsetParent!==null) resolve(el); };
+            check();
+            const obs = new MutationObserver(check);
+            obs.observe(document.body, {childList:true, subtree:true, attributes:true});
+            setTimeout(() => { obs.disconnect(); resolve(null); }, timeout);
+        });
+    }
+    function findCodeInput() {
+        const cands = [...document.querySelectorAll('input[type="text"],input:not([type])')];
+        for (const i of cands) { if(i.id==='ocr-url-box-v42')continue; if(i.offsetParent===null)continue; return i; }
+        return document.querySelector('input[name="code"]') ||
+               document.querySelector('input[placeholder*="ma" i]') ||
+               document.querySelector('input[placeholder*="code" i]') || null;
+    }
+    function findConfirmBtn() {
+        const all = [...document.querySelectorAll('button')].filter(b => b.offsetParent!==null && !b.disabled && b.id!=='submit-button');
+        const confirm = all.find(b => { const t=(b.innerText||b.textContent||'').toLowerCase().trim(); return t.includes('xac nhan')||t.includes('confirm')||t.includes('submit'); });
+        if (confirm) return confirm;
+        return all.find(b => b.type==='submit') || all.find(b => b.classList.contains('link-primary-button')) || null;
+    }
+    function simClick(el) {
+        if (!el) return;
+        el.scrollIntoView({behavior:'smooth', block:'center'}); el.focus();
+        ['pointerdown','mousedown','pointerup','mouseup'].forEach(ev =>
+            el.dispatchEvent(new (ev.startsWith('pointer')?PointerEvent:MouseEvent)(ev, {bubbles:true, cancelable:true})));
+        el.click();
+    }
+    function showToast(msg) {
+        // Xóa toast cũ nếu có
+        document.querySelectorAll('.__ocr_toast__').forEach(t => t.remove());
+        const t = document.createElement('div');
+        t.__ocr = true;
+        t.className = '__ocr_toast__';
+        t.textContent = msg;
+        t.style.cssText = 'position:fixed;bottom:30px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,#0d0d1a,#12121f);border:1px solid rgba(0,229,255,.3);color:#00e5ff;font-family:"Share Tech Mono",monospace;font-size:12px;padding:12px 24px;border-radius:12px;z-index:9999999;box-shadow:0 4px 32px rgba(0,0,0,.6);white-space:pre-line;text-align:center;line-height:1.7;backdrop-filter:blur(8px);';
+        document.body.appendChild(t);
+        setTimeout(() => { t.style.transition='opacity .4s'; t.style.opacity='0'; setTimeout(() => t.remove(), 400); }, 3000);
+    }
+
+    // ─── [FIX] BALLOON BUTTON FINDER - mạnh hơn, thêm fallback ──────────
+    function findBalloonBtn() {
+        // Cách 1: Tìm qua querySelectorAll các phần tử clickable chứa img balloon.svg
+        const clickables = document.querySelectorAll("button, a, [role='button'], [onclick], [data-click='true'], div, span");
+        for (const el of clickables) {
+            for (const img of el.querySelectorAll('img')) {
+                const src = img.src || img.getAttribute('src') || '';
+                if (src.includes('balloon.svg') || src.includes('balloon')) {
+                    // Trả về phần tử button/a cha gần nhất
+                    let node = img;
+                    while (node && node !== document.body) {
+                        if (node.tagName === 'BUTTON' || node.tagName === 'A') return node;
+                        node = node.parentElement;
+                    }
+                    return img.closest('button') || img.closest('a') || img.parentElement || img;
+                }
+            }
+            // Kiểm tra background image
+            try {
+                const bg = window.getComputedStyle(el).backgroundImage || '';
+                if (bg.includes('balloon.svg') || bg.includes('balloon')) return el;
+            } catch(_) {}
+        }
+        // Cách 2: Tìm trực tiếp img[src*="balloon"]
+        const balloonImg = document.querySelector('img[src*="balloon.svg"], img[src*="balloon"]');
+        if (balloonImg) {
+            let node = balloonImg.parentElement;
+            while (node && node !== document.body) {
+                if (node.tagName === 'BUTTON' || node.tagName === 'A' ||
+                    node.getAttribute('role') === 'button' ||
+                    node.onclick || node.getAttribute('data-click') === 'true') return node;
+                node = node.parentElement;
+            }
+            return balloonImg.parentElement || balloonImg;
+        }
+        return null;
+    }
+
+    function isPinkBtn11(el) {
+        if (!el || el.offsetParent===null) return false;
+        const text = (el.innerText||el.textContent||''); if (!text.includes('(1/1)')) return false;
+        const style = window.getComputedStyle(el); const bg = style.backgroundColor;
+        if (bg.includes('244, 63, 143')||bg.includes('244,63,143')) return true;
+        const rgb = bg.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+        if (rgb) { const r=parseInt(rgb[1]),g=parseInt(rgb[2]),b=parseInt(rgb[3]); if(r>200&&g<110&&b>70) return true; }
+        return false;
+    }
+
+    // ─── CLICK ON TARGET SITE ─────────────────────────────────────────────
+    async function clickOnTargetSite() {
+        // [FIX] Clear window.name ĐÂY - sau khi đã chạy vào flow, không phải ở top-level
+        // Điều này ngăn các navigation sau này re-trigger flow
+        window.name = '';
+
+        preventThrottling();
+
+        const getPinkBtn11 = () => {
+            for (const btn of document.querySelectorAll('button')) { if (isPinkBtn11(btn)) return btn; }
+            return null;
+        };
+        const getCountdownEl = () => {
+            const el = document.querySelector('[data-click="true"][data-time]');
+            if (el) { const v = parseInt(el.getAttribute('data-time')); if (v > 0 && v < 600) return {el, sec: v}; }
+            for (const e of document.querySelectorAll('[data-time]')) {
+                const v = parseInt(e.getAttribute('data-time')); if (v > 0 && v < 600) return {el: e, sec: v};
+            }
+            return null;
+        };
+
+        showToast('Trang tải, chờ 4s...');
+        await workerSleep(4000);
+
+        // Tìm balloon button với retry
+        let b1 = null;
+        for (let i = 0; i < 20; i++) {
+            b1 = findBalloonBtn();
+            if (b1) { console.log('[BALLOON] Tìm thấy sau', i, 'lần thử:', b1); break; }
+            await workerSleep(1000);
+        }
+        if (!b1) { showToast('Không tìm thấy nút balloon!\nKiểm tra trang có balloon.svg không.'); return; }
+        showToast('Tìm thấy balloon, click...');
+        simClick(b1);
+
+        let b2 = null;
+        for (let i = 0; i < 15; i++) {
+            await workerSleep(1000);
+            b2 = getPinkBtn11();
+            if (b2) break;
+        }
+        if (!b2) { showToast('Nút (1/1) không tìm thấy!'); return; }
+        await workerSleep(1500);
+        simClick(b2);
+
+        let countdownSec = 0;
+        showToast('Đang đọc countdown...');
+        for (let attempt = 0; attempt < 60; attempt++) {
+            await workerSleep(500);
+            const found = getCountdownEl();
+            if (found) { countdownSec = found.sec; break; }
+        }
+        if (!countdownSec) { showToast('Không đọc được data-time!'); return; }
+
+        const endTime = Date.now() + countdownSec * 1000;
+        try {
+            localStorage.setItem(COUNTDOWN_KEY, endTime.toString());
+            if (window.opener && !window.opener.closed) window.opener.localStorage.setItem(COUNTDOWN_KEY, endTime.toString());
+        } catch (_) {}
+
+        showToast(`Đếm ngược: ${countdownSec}s`);
+        await workerSleep(countdownSec * 1000, remMs => { showToast(`${Math.ceil(remMs / 1000)}s`); });
+        showToast('Xong countdown - click nút hồng...');
+
+        let clickedBtn = null, clickCount = 0;
+        for (let attempt = 0; attempt < 20; attempt++) {
+            const btn = getPinkBtn11();
+            if (btn) {
+                simClick(btn); clickedBtn = btn; clickCount++;
+                if (clickCount === 1) {
+                    await workerSleep(600);
+                    const btn2 = getPinkBtn11();
+                    if (btn2) { simClick(btn2); clickCount++; }
+                }
+                break;
+            }
+            await workerSleep(800);
+        }
+
+        if (!clickedBtn) { showToast('Không tìm thấy nút hồng (1/1) sau countdown'); return; }
+        showToast('Chờ thêm 4s lấy code...');
+        await workerSleep(4000);
+
+        let code = null;
+        for (let attempt=0; attempt<20; attempt++) {
+            await workerSleep(300);
+            const divs = document.querySelectorAll('div,span,button,p');
+            for (const el of divs) {
+                if (el.offsetParent===null) continue;
+                const text = (el.textContent||'').trim();
+                if (!/^[A-Z0-9]{4,12}$/.test(text)) continue;
+                const style = window.getComputedStyle(el), bg = style.backgroundColor;
+                let isPink = bg.includes('244, 63, 143') || bg.includes('244,63,143');
+                const rgbM = bg.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+                if (rgbM) { const r=parseInt(rgbM[1]),g=parseInt(rgbM[2]),b=parseInt(rgbM[3]); if(r>200&&g<120&&b>70) isPink=true; }
+                if (isPink) { code=text; break; }
+                const fg = style.color;
+                if (fg==='rgb(255, 255, 255)'||fg.includes('255, 255, 255')) {
+                    const bgRGB = bg.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+                    if (bgRGB) { const r=parseInt(bgRGB[1]),g=parseInt(bgRGB[2]),b=parseInt(bgRGB[3]); if(r<100&&g<100&&b<100){code=text;break;} }
+                }
+            }
+            if (code) break;
+            if (!code && attempt>10) {
+                for (const el of document.querySelectorAll('div,span,button,p')) {
+                    if (el.offsetParent===null) continue;
+                    const text=(el.textContent||'').trim();
+                    if (/^[A-Z0-9]{4,12}$/.test(text)){code=text;break;}
+                }
+            }
+        }
+
+        try { localStorage.removeItem(COUNTDOWN_KEY); if(window.opener&&!window.opener.closed) window.opener.localStorage.removeItem(COUNTDOWN_KEY); } catch(_) {}
+        if (!code) { showToast('Không tìm thấy code!'); return; }
+        if (!/^[A-Z0-9]{4,12}$/.test(code)) { showToast('Code không hợp lệ: '+code); return; }
+
+        try { GM_setClipboard(code); }
+        catch { try { await navigator.clipboard.writeText(code); }
+        catch { const ta=Object.assign(document.createElement('textarea'),{value:code}); ta.style.cssText='position:fixed;opacity:0'; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); } }
+
+        if (window.opener && !window.opener.closed) {
+            try {
+                window.opener.localStorage.setItem(CODE_KEY, code);
+                window.opener.dispatchEvent(new window.opener.StorageEvent('storage', {key:CODE_KEY,newValue:code,storageArea:window.opener.localStorage}));
+            } catch { window.opener.postMessage({type:'OCR_CODE',code},'*'); }
+        } else { localStorage.setItem(CODE_KEY, code); }
+
+        showToast(`CODE: ${code}\nĐã copy & gửi về tab gốc.\nĐóng sau 3s...`);
+        await workerSleep(3000);
+        window.close();
+    }
+
+    // ─── ENTRY POINT ──────────────────────────────────────────────────────
+    if (isOnTaplayma) {
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', createUI);
+        else createUI();
+    } else if (isOpenedByScript) {
+        preventThrottling();
+        const runFlow = () => setTimeout(clickOnTargetSite, 3000);
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', runFlow);
+        else runFlow();
+    }
+
+})();
