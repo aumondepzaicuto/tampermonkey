@@ -1,0 +1,1163 @@
+// ==UserScript==
+// @name         NHAPMA OCR PRO v1 (AI Vision)
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  v1 - Auto OCR + auto flow cho nhapma.com. AI Vision quét URL, tự động điền mã, xử lý captcha.
+// @match        https://nhapma.com/*
+// @match        https://www.google.com/url*
+// @match        *://*/*
+// @grant        GM_setClipboard
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @grant        unsafeWindow
+// @run-at       document-start
+// @connect      openrouter.ai
+// @connect      *
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ─── CONFIG ───────────────────────────────────────────────────────────
+    const API_KEY         = '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';
+    const TARGET_SELECTOR = 'img[data-v-9b370738]';
+
+    const TAB_NAME       = 'nhapma_target_v1';
+    const IMG_MAP_KEY    = 'nhapma_img_map_v1';
+    const COUNTDOWN_KEY  = 'nhapma_countdown_end_v1';
+    const CODE_KEY       = 'nhapma_pending_code_v1';
+
+    // ─── DANH SÁCH MODEL FREE VISION ─────────────────────────────────────
+    const HARDCODED_FREE_VISION_MODELS = [
+        'google/gemini-2.5-flash-preview:free',
+        'google/gemini-2.0-flash-exp:free',
+        'google/gemini-flash-1.5:free',
+        'google/gemini-flash-1.5-8b:free',
+        'google/gemini-2.0-flash-thinking-exp:free',
+        'meta-llama/llama-4-scout:free',
+        'meta-llama/llama-4-maverick:free',
+        'meta-llama/llama-3.2-11b-vision-instruct:free',
+        'meta-llama/llama-3.2-90b-vision-instruct:free',
+        'qwen/qwen2.5-vl-72b-instruct:free',
+        'qwen/qwen2.5-vl-7b-instruct:free',
+        'qwen/qwen-vl-plus:free',
+        'mistralai/pixtral-12b:free',
+        'microsoft/phi-3.5-vision-instruct:free',
+        'microsoft/phi-4-multimodal-instruct:free',
+        'openai/gpt-4o-mini:free',
+        'anthropic/claude-3-haiku:free',
+        'bytedance-research/ui-tars-7b:free',
+        'moonshotai/kimi-vl-a3b-thinking:free',
+    ];
+
+    const isForceRunTab = (window.name === TAB_NAME);
+    if (isForceRunTab) _installForceRun(window);
+
+    // ─── FORCE-RUN (chống throttle tab nền) ──────────────────────────────
+    function _installForceRun(win) {
+        try {
+            Object.defineProperty(win.document, 'hidden',          { get: () => false,     configurable: true });
+            Object.defineProperty(win.document, 'visibilityState', { get: () => 'visible', configurable: true });
+            win.document.addEventListener('visibilitychange', e => { e.stopImmediatePropagation(); e.preventDefault(); }, true);
+        } catch (_) {}
+        const _keepRaf = () => win.requestAnimationFrame(_keepRaf);
+        win.requestAnimationFrame(_keepRaf);
+        const WORKER_CODE = `var timers={};self.onmessage=function(e){var m=e.data;if(m.cmd==='ST'){var tid=setTimeout(function(){delete timers[m.mid];self.postMessage({mid:m.mid,type:'ST'});},m.delay);timers[m.mid]=tid;}else if(m.cmd==='SI'){var tid=setInterval(function(){self.postMessage({mid:m.mid,type:'SI'});},m.delay);timers[m.mid]=tid;}else if(m.cmd==='CLR'){if(timers[m.mid]){clearTimeout(timers[m.mid]);clearInterval(timers[m.mid]);delete timers[m.mid];}}};`;
+        let _timerWorker = null;
+        try { const blob = new Blob([WORKER_CODE], { type: 'application/javascript' }); _timerWorker = new Worker(URL.createObjectURL(blob)); } catch (_) {}
+        if (_timerWorker) {
+            const _cbMap = new Map(); let _mid = 1;
+            _timerWorker.onmessage = function(e) {
+                const { mid, type } = e.data; const entry = _cbMap.get(mid); if (!entry) return;
+                try { if (typeof entry.fn === 'function') entry.fn(...(entry.args || [])); else { try { eval(entry.fn); } catch(_){} } } catch(_) {}
+                if (type === 'ST') _cbMap.delete(mid);
+            };
+            const _origST = win.setTimeout.bind(win), _origSI = win.setInterval.bind(win), _origCST = win.clearTimeout.bind(win);
+            win.setTimeout  = function(fn, delay, ...args) { delay=+delay||0; if(delay<300)return _origST(fn,delay,...args); const mid=_mid++;_cbMap.set(mid,{fn,args});_timerWorker.postMessage({cmd:'ST',mid,delay});return -(mid+900000); };
+            win.setInterval = function(fn, delay, ...args) { delay=+delay||4; if(delay<300)return _origSI(fn,delay,...args); const mid=_mid++;_cbMap.set(mid,{fn,args,repeat:true});_timerWorker.postMessage({cmd:'SI',mid,delay});return -(mid+900000); };
+            const _clearShared = id => { if(typeof id==='number'&&id<-900000){const mid=-(id+900000);_cbMap.delete(mid);_timerWorker.postMessage({cmd:'CLR',mid});}else{_origCST(id);}};
+            win.clearTimeout = _clearShared; win.clearInterval = _clearShared;
+        }
+        try {
+            const AC = win.AudioContext || win.webkitAudioContext;
+            if (AC) { const ac=new AC(),buf=ac.createBuffer(1,1,22050),src=ac.createBufferSource(),g=ac.createGain();g.gain.value=0.00001;src.buffer=buf;src.loop=true;src.connect(g);g.connect(ac.destination);src.start(0);setInterval(()=>{if(ac.state==='suspended')ac.resume();},1000); }
+        } catch(_) {}
+    }
+
+    // ─── GOOGLE REDIRECT ──────────────────────────────────────────────────
+    const host = location.hostname;
+    if (host.includes('google.com') && location.pathname === '/url') {
+        const real = new URLSearchParams(location.search).get('q');
+        if (real) location.href = real;
+        return;
+    }
+
+    const isOnNhapma     = host.includes('nhapma.com');
+    const isOpenedByScript = isForceRunTab || (() => { try { return !isOnNhapma && window.opener && !window.opener.closed; } catch(e) { return false; } })();
+    if (!isOnNhapma && !isOpenedByScript) return;
+
+    // ─── HELPERS ──────────────────────────────────────────────────────────
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    function workerSleep(ms, onTick) {
+        return new Promise(resolve => {
+            const code = `var start=Date.now(),dur=${ms};var iv=setInterval(function(){var el=Date.now()-start,rem=Math.max(0,dur-el);self.postMessage({elapsed:el,remaining:rem});if(el>=dur){clearInterval(iv);self.postMessage({done:true});}},200);`;
+            const w = new Worker(URL.createObjectURL(new Blob([code], { type: 'application/javascript' })));
+            w.onmessage = e => { if (e.data.done) { w.terminate(); resolve(); } else if (onTick) onTick(e.data.remaining); };
+        });
+    }
+
+    let _ac = null;
+    function preventThrottling() {
+        const tryStart = () => {
+            try {
+                const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+                if (!_ac) { _ac=new AC();const buf=_ac.createBuffer(1,1,22050),src=_ac.createBufferSource(),g=_ac.createGain();g.gain.value=0.00001;src.buffer=buf;src.loop=true;src.connect(g);g.connect(_ac.destination);src.start(0); }
+                if (_ac.state === 'suspended') _ac.resume();
+            } catch(_) {}
+        };
+        tryStart();
+        ['click','touchstart','keydown'].forEach(ev => document.addEventListener(ev, tryStart, {passive:true}));
+        setInterval(() => { if (_ac && _ac.state==='suspended') _ac.resume(); }, 2000);
+    }
+
+    // ─── STORAGE ──────────────────────────────────────────────────────────
+    const getList  = () => { try { return JSON.parse(localStorage.getItem('url_list') || '[]'); } catch { return []; } };
+    const saveList = l  => localStorage.setItem('url_list', JSON.stringify(l));
+    function addURL(url) { const l=getList(); if(!l.includes(url)){l.unshift(url);saveList(l);} }
+
+    function getImgMap()   { try { return JSON.parse(localStorage.getItem(IMG_MAP_KEY)||'{}'); } catch { return {}; } }
+    function saveImgMap(m) { localStorage.setItem(IMG_MAP_KEY, JSON.stringify(m)); }
+    function normKey(src) {
+        if (!src) return '';
+        try { const u=new URL(src); return (u.origin+u.pathname).toLowerCase(); }
+        catch { return src.toLowerCase().replace(/\?.*$/,''); }
+    }
+    function saveImgURL(imgSrc, url, votes) {
+        if (!imgSrc||!url) return;
+        const m=getImgMap(), k=normKey(imgSrc); if(!k) return;
+        const prev=m[k]||{count:0};
+        m[k]={url,votes:votes||1,lastSeen:Date.now(),count:(prev.count||0)+1};
+        saveImgMap(m);
+    }
+    function lookupImgURL(imgSrc) {
+        if (!imgSrc) return null;
+        const m=getImgMap(), k=normKey(imgSrc);
+        return m[k] ? m[k].url : null;
+    }
+
+    // ─── EXPORT / IMPORT ──────────────────────────────────────────────────
+    function exportData() {
+        const payload = {version:'nhapma_v1',exported_at:new Date().toISOString(),url_list:getList(),ocr_img_map:getImgMap()};
+        const a=document.createElement('a');
+        a.href=URL.createObjectURL(new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}));
+        a.download=`nhapma_backup_${Date.now()}.json`; a.click(); URL.revokeObjectURL(a.href);
+    }
+    function importData(file, onDone) {
+        const r=new FileReader();
+        r.onload=e=>{
+            try {
+                const data=JSON.parse(e.target.result); let au=0,ai=0;
+                if(Array.isArray(data.url_list)){const cur=getList(),merged=[...new Set([...data.url_list,...cur])];saveList(merged);au=data.url_list.filter(u=>!cur.includes(u)).length;}
+                if(data.ocr_img_map&&typeof data.ocr_img_map==='object'){const cur=getImgMap();for(const[k,v]of Object.entries(data.ocr_img_map)){if(!cur[k]||(v.lastSeen||0)>(cur[k].lastSeen||0)){cur[k]=v;ai++;}}saveImgMap(cur);}
+                onDone(`+${au} URL, +${ai} ảnh`,'ok');
+            } catch(err){onDone('File lỗi: '+err.message,'err');}
+        };
+        r.readAsText(file);
+    }
+
+    // ─── DOM URL SCAN ─────────────────────────────────────────────────────
+    const TLD_LIST = ['com','net','org','io','vn','co','app','link','site','me','tv','gg','bet','win','club','live','online','xyz','info','pro','cc','us','uk','id','sg','ph','th','my','top','fun','store','shop','game','nl','de','fr','jp','ru','au','ca','br','in','es','it','pl','se','no','dk','fi','be','at','ch','gr','pt','tr','mx','ar','cl','pe','nz','biz','mobi','asia'];
+    const TLD_PAT  = TLD_LIST.join('|');
+
+    function cleanURL(u) {
+        if (!u) return '';
+        u = u.trim();
+        u = u.replace(/[.,;:!?)>"''«»\]`]+$/g, '').trim();
+        if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+        u = u.replace(/\.{2,}/g, '.').replace(/\/+$/, '');
+        return u;
+    }
+
+    function isValidURL(u) {
+        if (!u||u.length<10) return false;
+        if (!/^https?:\/\//i.test(u)) return false;
+        if (!/https?:\/\/[a-zA-Z0-9\-]{2,}\.[a-zA-Z]{2,}/i.test(u)) return false;
+        if (/\.\.\.|localhost|127\.|192\.168\./.test(u)) return false;
+        const domain=u.replace(/^https?:\/\//i,'').split('/')[0];
+        const parts=domain.split('.');
+        if (parts.length<2||parts[0].length<2) return false;
+        if (/[^a-zA-Z0-9\-\.]/.test(domain)) return false;
+        return TLD_LIST.includes(parts[parts.length-1].toLowerCase());
+    }
+
+    function scanPageMetaURLs() {
+        const found=new Set();
+        const add=u=>{const c=cleanURL(u);if(isValidURL(c)&&!c.includes('nhapma')&&!c.includes('google.com'))found.add(c);};
+        const canonical=document.querySelector('link[rel="canonical"]'); if(canonical?.href) add(canonical.href);
+        const ogUrl=document.querySelector('meta[property="og:url"]');   if(ogUrl?.content)  add(ogUrl.content);
+        const twUrl=document.querySelector('meta[name="twitter:url"]');  if(twUrl?.content)  add(twUrl.content);
+        return [...found];
+    }
+    function quickScanDOMForURL() {
+        const found=new Set();
+        for (const u of scanPageMetaURLs()) found.add(u);
+        const TLD_RE=new RegExp(`https?:\\/\\/[^\\s<>"']{4,}|www\\.[a-zA-Z0-9\\-]{2,60}\\.(?:${TLD_PAT})(?:\\/[^\\s<>"']*)?`,'gi');
+        for (const el of document.querySelectorAll('cite,a,span,div,p,small,[class*="url"],[class*="link"]')) {
+            if (el.offsetParent===null) continue;
+            const t=(el.innerText||el.textContent||'').trim();
+            if (t.length<4||t.length>300) continue;
+            for (const m of t.matchAll(TLD_RE)){const u=cleanURL(m[0].startsWith('http')?m[0]:'https://'+m[0]);if(isValidURL(u))found.add(u);}
+        }
+        for (const a of document.querySelectorAll('a[href]')){const href=a.href||'';if(isValidURL(href)&&!href.includes('nhapma')&&!href.includes('google.com/url'))found.add(href);}
+        return [...found];
+    }
+    function fuzzyMatch(rawUrl) {
+        if (!rawUrl) return {url:rawUrl,matched:false,score:0};
+        const list=getList(); if(!list.length) return {url:rawUrl,matched:false,score:0};
+        const norm=u=>u.toLowerCase().replace(/^https?:\/\/(www\.)?/,'').replace(/\/+$/,'');
+        const nr=norm(rawUrl);
+        for (const s of list) if(norm(s)===nr) return {url:s,matched:true,score:1};
+        let best=null,bScore=0;
+        for (const s of list){const ns=norm(s);if(ns.includes(nr)||nr.includes(ns)){const sc=Math.min(nr.length,ns.length)/Math.max(nr.length,ns.length);if(sc>=0.65&&sc>bScore){bScore=sc;best=s;}}}
+        if (best) return {url:best,matched:true,score:bScore};
+        return {url:rawUrl,matched:false,score:0};
+    }
+    function showCandidates(urls) {
+        const cb=document.getElementById('ocr-cand-box-nm'); if(!cb) return;
+        if (!urls||urls.length<=1){cb.style.display='none';return;}
+        cb.style.display='block';
+        cb.innerHTML=urls.slice(0,6).map(u=>`<div class="ocr-cand-nm" title="${u}" onclick="document.getElementById('ocr-url-box-nm').value='${u.replace(/'/g,"\\'")}'">  ${u}</div>`).join('');
+    }
+
+    // ─── URL EXTRACTOR TỪ RESPONSE AI ────────────────────────────────────
+    function extractURLFromAIText(rawText) {
+        if (!rawText) return '';
+        let text = rawText.trim();
+        const fullUrlRe = /https?:\/\/[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/gi;
+        const fullMatches = text.match(fullUrlRe);
+        if (fullMatches) {
+            for (const m of fullMatches) { const c=cleanURL(m); if(isValidURL(c)) return c; }
+        }
+        const wwwRe = new RegExp(`www\\.([a-zA-Z0-9\\-]{2,60}\\.(?:${TLD_PAT})(?:\\/[^\\s]*)?)`, 'gi');
+        const wwwMatches = text.match(wwwRe);
+        if (wwwMatches) { const c=cleanURL(wwwMatches[0]); if(isValidURL(c)) return c; }
+        const domainRe = new RegExp(`\\b([a-zA-Z0-9][a-zA-Z0-9\\-]{1,59}\\.(?:${TLD_PAT}))(?:[/\\s"'\`]|$)`, 'gi');
+        let dm; const domCandidates=[];
+        while ((dm=domainRe.exec(text))!==null) { const c=cleanURL(dm[1]); if(isValidURL(c)) domCandidates.push(c); }
+        if (domCandidates.length>0) { domCandidates.sort((a,b)=>b.length-a.length); return domCandidates[0]; }
+        if (text.length<80&&!text.includes(' ')&&text.includes('.')) { const c=cleanURL(text.replace(/^["'`]|["'`]$/g,'')); if(isValidURL(c)) return c; }
+        const words=text.split(/[\s\n,;"'`()\[\]]+/);
+        for (const w of words) { if(w.includes('.')&&w.length>4){const c=cleanURL(w);if(isValidURL(c))return c;} }
+        return text;
+    }
+
+    // ─── AI VISION ENGINE ─────────────────────────────────────────────────
+    function findTargetImage() {
+        for (const img of document.querySelectorAll(TARGET_SELECTOR)) {
+            if (img.src && img.src.startsWith('http') && !img.src.includes('muabit') && (img.naturalWidth===0||img.naturalWidth>10))
+                return img;
+        }
+        for (const img of document.querySelectorAll('img')) {
+            if (img.src && img.src.startsWith('http') && !img.src.includes('muabit') && !img.src.includes('angular-icon') && !img.src.includes('logo') && (img.naturalWidth>50||img.naturalWidth===0))
+                return img;
+        }
+        return null;
+    }
+
+    function fetchBase64(url) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method:'GET', url, responseType:'blob', timeout:25000,
+                onload: res => {
+                    if (res.status<200||res.status>=300){reject(new Error('HTTP '+res.status));return;}
+                    const reader=new FileReader();
+                    reader.onloadend=()=>{ const dataUrl=reader.result; resolve({base64:dataUrl.split(',')[1],mime:(res.response.type||'image/jpeg').split(';')[0]}); };
+                    reader.onerror=()=>reject(new Error('FileReader lỗi'));
+                    reader.readAsDataURL(res.response);
+                },
+                onerror:   ()=>reject(new Error('Không tải được ảnh')),
+                ontimeout: ()=>reject(new Error('Timeout tải ảnh'))
+            });
+        });
+    }
+
+    async function getVisionModels(setStatus) {
+        let dynamicModels=[];
+        try {
+            setStatus('📋 Fetch model list từ OpenRouter...','#9b59b6');
+            dynamicModels = await new Promise((resolve,reject) => {
+                GM_xmlhttpRequest({
+                    method:'GET', url:'https://openrouter.ai/api/v1/models',
+                    headers:{'Authorization':`Bearer ${API_KEY}`,'Content-Type':'application/json'}, timeout:10000,
+                    onload: res => {
+                        try {
+                            const all=JSON.parse(res.responseText).data||[];
+                            const models=all.filter(m=>{
+                                const isFree=m.id.endsWith(':free')||(m.pricing&&(m.pricing.prompt==='0'||m.pricing.prompt===0)&&(m.pricing.completion==='0'||m.pricing.completion===0));
+                                const hasVision=(m.architecture?.input_modalities||[]).includes('image')||(m.architecture?.modality||'').includes('image')||/vision|vl|flash|gemini|pixtral|qwen.*vl|llama.*vision|phi.*vision|phi.*multimodal|kimi-vl|ui-tars/i.test(m.id);
+                                return isFree&&hasVision;
+                            }).map(m=>m.id);
+                            resolve(models);
+                        } catch(e){reject(e);}
+                    },
+                    onerror:()=>reject(new Error('Network error')), ontimeout:()=>reject(new Error('Timeout'))
+                });
+            });
+        } catch(err) { console.warn('[NHAPMA OCR] Không fetch được model list:',err.message); }
+        const merged=[...HARDCODED_FREE_VISION_MODELS];
+        for (const m of dynamicModels) { if(!merged.includes(m)) merged.push(m); }
+        setStatus(`📋 ${merged.length} model sẵn sàng`,'#9b59b6');
+        return merged;
+    }
+
+    function callAIModel(base64, mime, model) {
+        const PROMPT=`Look at this image carefully. Find any website URL, domain name, or web address shown in the image.
+Output ONLY the domain or URL with no explanation, no punctuation, no quotes.
+Examples of good output: hitclub.si | www.abc88.com | https://xyz.net
+If no URL found, output: NONE`;
+        return new Promise((resolve,reject) => {
+            GM_xmlhttpRequest({
+                method:'POST', url:'https://openrouter.ai/api/v1/chat/completions',
+                headers:{'Content-Type':'application/json','Authorization':`Bearer ${API_KEY}`,'HTTP-Referer':'https://tampermonkey.net','X-Title':'NHAPMA OCR v1'},
+                data:JSON.stringify({model,messages:[{role:'user',content:[{type:'image_url',image_url:{url:`data:${mime};base64,${base64}`,detail:'high'}},{type:'text',text:PROMPT}]}],max_tokens:120,temperature:0,top_p:1}),
+                timeout:45000,
+                onload: res => {
+                    let data; try{data=JSON.parse(res.responseText);}catch(e){reject(new Error('JSON parse lỗi'));return;}
+                    if (data.error){const errMsg=typeof data.error==='object'?(data.error.message||JSON.stringify(data.error)):String(data.error);if(errMsg.includes('rate')||errMsg.includes('429')||errMsg.includes('quota')){reject(new Error('RATE_LIMIT: '+errMsg));}else{reject(new Error(errMsg));}return;}
+                    if (res.status<200||res.status>=300){reject(new Error('HTTP '+res.status));return;}
+                    const text=data?.choices?.[0]?.message?.content?.trim();
+                    if (!text||text.toUpperCase()==='NONE'||text.length<2){reject(new Error('Phản hồi rỗng hoặc NONE'));return;}
+                    const extracted=extractURLFromAIText(text);
+                    const usedModel=data?.model||model;
+                    console.log(`[NHAPMA OCR][${model.split('/').pop()}] Raw: "${text}" → Extracted: "${extracted}"`);
+                    if (!extracted||extracted.length<4){reject(new Error('Không extract được URL từ: '+text.substring(0,60)));return;}
+                    resolve({text:extracted,rawText:text,usedModel});
+                },
+                onerror:()=>reject(new Error('Mất kết nối')), ontimeout:()=>reject(new Error('Timeout 45s'))
+            });
+        });
+    }
+
+    async function tryAIModels(base64, mime, models, setStatus) {
+        const errors=[];
+        for (let i=0; i<models.length; i++) {
+            const model=models[i], shortName=model.split('/').pop().replace(':free','');
+            setStatus(`🤖 [${i+1}/${models.length}] ${shortName}`,'#3498db');
+            try {
+                const result=await callAIModel(base64,mime,model);
+                if (result.text&&result.text.length>3&&!result.text.includes('NONE')) return result;
+                errors.push(`${shortName}: kết quả không hợp lệ "${result.text}"`);
+            } catch(err) {
+                const errMsg=err.message||String(err);
+                errors.push(`${shortName}: ${errMsg}`);
+                console.warn(`[NHAPMA OCR][SKIP] ${model}: ${errMsg}`);
+                const delay=errMsg.includes('RATE_LIMIT')?200:300;
+                if (i<models.length-1){setStatus(`⏩ Skip ${shortName}...`,'#f39c12');await sleep(delay);}
+            }
+        }
+        throw new Error(`Đã thử ${models.length} model.\nLỗi cuối: ${errors.slice(-3).join(' | ')}`);
+    }
+
+    // ─── XÓA QUẢNG CÁO ───────────────────────────────────────────────────
+    function removeAds() {
+        try {
+            document.querySelectorAll('div.mb-6.text-center').forEach(div => {
+                if (div.querySelector('a[href*="muabit.com"]')) div.remove();
+            });
+            document.querySelectorAll('a[href*="muabit.com"], a[href*="zpi.cx"]').forEach(a => {
+                let node=a;
+                for (let i=0;i<4;i++){const parent=node.parentElement;if(!parent||parent===document.body)break;if(parent.children.length<=3){node=parent;}else break;}
+                node.remove();
+            });
+            document.querySelectorAll('[class*="ads"],[class*="ad-"],[id*="ads"],[id*="banner"]').forEach(el=>{
+                if(el.offsetHeight>0&&el.offsetHeight<200&&!el.querySelector('input,button[type="submit"]'))el.style.display='none';
+            });
+        } catch(e) { console.warn('[NHAPMA OCR] removeAds lỗi:',e); }
+    }
+
+    // ─── MAIN AI SCAN ─────────────────────────────────────────────────────
+    async function runAIScan(setStatus, urlBox, autoOpen) {
+        if (window._ocrUI) { window._ocrUI.lastScannedImgKey=null; window._ocrUI.lastScannedImgSrc=null; }
+        setStatus('🧹 Xóa quảng cáo...','#f1c40f');
+        removeAds(); await sleep(400);
+
+        // 1. Meta tags
+        const metaURLs=scanPageMetaURLs();
+        if (metaURLs.length){
+            urlBox.value=metaURLs[0];
+            setStatus('✅ Meta/OG: '+metaURLs[0],'ok');
+            showCandidates(metaURLs);
+            if (autoOpen) _triggerAutoOpen(metaURLs[0]);
+            return;
+        }
+
+        // 2. DOM scan
+        const domURLs=quickScanDOMForURL().filter(u=>!u.includes('nhapma')&&!u.includes('google.com/url'));
+        if (domURLs.length){
+            const m=fuzzyMatch(domURLs[0]);
+            urlBox.value=m.url||domURLs[0];
+            setStatus('✅ DOM: '+domURLs.length+' URL tìm thấy','ok');
+            showCandidates(domURLs);
+            if (autoOpen) _triggerAutoOpen(m.url||domURLs[0]);
+            return;
+        }
+
+        // 3. Image cache
+        for (const img of document.images){
+            const cached=lookupImgURL(img.src);
+            if(cached){
+                const m=fuzzyMatch(cached);
+                urlBox.value=m.url||cached;
+                if(window._ocrUI){window._ocrUI.selectedImgKey=normKey(img.src);window._ocrUI.lastScannedImgKey=normKey(img.src);window._ocrUI.lastScannedImgSrc=img.src;}
+                setStatus('✅ Cache hit!','ok');
+                // Cache hit được xử lý riêng ở ngoài (auto-open với đếm ngược)
+                return;
+            }
+        }
+
+        // 4. Tìm ảnh target
+        setStatus('🔍 Tìm ảnh target...','#f1c40f');
+        await sleep(1000);
+        const img=findTargetImage();
+        if (!img){setStatus('❌ Không tìm thấy ảnh target!','#e74c3c');return;}
+        const imgSrc=img.src;
+        if (window._ocrUI){window._ocrUI.lastScannedImgSrc=imgSrc;window._ocrUI.lastScannedImgKey=normKey(imgSrc);}
+        console.log('[NHAPMA OCR] Ảnh target:',imgSrc);
+
+        // 5. Tải ảnh
+        setStatus('📥 Tải ảnh...','#f1c40f');
+        let imgData;
+        try { imgData=await fetchBase64(imgSrc); setStatus(`📥 Ảnh OK (${imgData.mime})`,'#f1c40f'); }
+        catch(err){ setStatus('❌ Lỗi tải ảnh: '+err.message,'#e74c3c'); return; }
+
+        // 6. Lấy danh sách model
+        let models;
+        try { models=await getVisionModels(setStatus); await sleep(200); }
+        catch(err){ models=[...HARDCODED_FREE_VISION_MODELS]; setStatus(`⚠️ Dùng ${models.length} model hardcode...`,'#f39c12'); }
+
+        // 7. Gọi AI
+        try {
+            const {text,rawText,usedModel}=await tryAIModels(imgData.base64,imgData.mime,models,setStatus);
+            const isValid=isValidURL(text.startsWith('http')?text:'https://'+text);
+            let finalURL=isValid?cleanURL(text):text;
+            const matched=fuzzyMatch(finalURL);
+            if (matched.matched) finalURL=matched.url;
+            urlBox.value=finalURL;
+            if (imgSrc){saveImgURL(imgSrc,finalURL,1);if(window._ocrUI)window._ocrUI.selectedImgKey=normKey(imgSrc);}
+            const modelShort=usedModel.split('/').pop().replace(':free','');
+            const matchInfo=matched.matched?`Matched ${Math.round(matched.score*100)}%`:`Model: ${modelShort}`;
+            const validMark=isValid?'✅':'⚠️';
+            setStatus(`${validMark} ${matchInfo} → ${finalURL}`,'ok');
+            console.log('[NHAPMA OCR] Result:',{finalURL,rawText,usedModel,isValid,matched});
+            // [MỚI] Tự động mở URL sau khi AI scan xong
+            if (autoOpen && isValid) _triggerAutoOpen(finalURL);
+        } catch(err){ setStatus('❌ AI lỗi: '+err.message,'#e74c3c'); console.error('[NHAPMA OCR] Scan thất bại:',err); }
+    }
+
+    // ─── [MỚI] AUTO-OPEN SAU KHI SCAN ────────────────────────────────────
+    // Đếm ngược 3s rồi tự click OPEN (cho phép người dùng cancel)
+    function _triggerAutoOpen(url) {
+        if (!url) return;
+        const shell = document.getElementById('ocr-shell-nm');
+        if (!shell) return;
+
+        // Hủy auto-open cũ nếu đang chạy
+        if (window._ocrAutoOpenTimer) {
+            clearInterval(window._ocrAutoOpenTimer);
+            window._ocrAutoOpenTimer = null;
+        }
+
+        let secs = 3;
+        const openBtn = shell.querySelector('#ocr-btn-open-nm');
+        const origText = openBtn ? openBtn.textContent : 'OPEN';
+
+        const doOpen = () => {
+            clearInterval(window._ocrAutoOpenTimer);
+            window._ocrAutoOpenTimer = null;
+            if (openBtn) openBtn.textContent = origText;
+            // Click nút OPEN
+            const btn = shell.querySelector('#ocr-btn-open-nm');
+            if (btn) btn.click();
+        };
+
+        // Đếm ngược hiện trên nút OPEN
+        if (openBtn) openBtn.textContent = `AUTO (${secs}s)`;
+        window._ocrAutoOpenTimer = setInterval(() => {
+            secs--;
+            if (secs <= 0) {
+                doOpen();
+            } else {
+                if (openBtn) openBtn.textContent = `AUTO (${secs}s)`;
+            }
+        }, 1000);
+
+        // Click vào nút OPEN bất kỳ lúc nào cũng hủy timer và mở luôn
+        // (đã được xử lý tự nhiên vì click sẽ gọi doOpen qua btn.click())
+    }
+
+    // ─── COUNTDOWN WATCHER ────────────────────────────────────────────────
+    function startCountdownWatcher() {
+        let overlayEl=null;
+        const getOrCreate=()=>{
+            if(overlayEl&&document.body.contains(overlayEl))return overlayEl;
+            overlayEl=document.createElement('div'); overlayEl.id='nhapma-countdown-v1';
+            overlayEl.style.cssText='position:fixed;bottom:16px;right:16px;background:linear-gradient(135deg,#0d0d12,#13131c);border:1px solid rgba(255,102,0,.4);border-radius:12px;padding:10px 20px;font-family:"Orbitron",monospace;font-size:24px;font-weight:900;color:#ff6600;z-index:9999998;box-shadow:0 0 30px rgba(255,102,0,.25),inset 0 1px 0 rgba(255,102,0,.1);text-align:center;min-width:100px;display:none;text-shadow:0 0 15px rgba(255,102,0,.8);letter-spacing:2px;';
+            document.body.appendChild(overlayEl); return overlayEl;
+        };
+        const tick=()=>{
+            const endStr=localStorage.getItem(COUNTDOWN_KEY), ov=getOrCreate();
+            if(!endStr){ov.style.display='none';setTimeout(tick,500);return;}
+            const remaining=Math.ceil((parseInt(endStr)-Date.now())/1000);
+            if(remaining<=0){localStorage.removeItem(COUNTDOWN_KEY);ov.style.display='none';setTimeout(tick,500);return;}
+            ov.style.display='block';ov.textContent=remaining+'s';setTimeout(tick,300);
+        };
+        tick();
+    }
+
+    // ─── [SỬA] CAPTCHA WATCHER ────────────────────────────────────────────
+    function startCaptchaWatcher(setStatus, autoBar) {
+        let watching=false, solved=false, solvedTimer=null;
+        const log=(msg,type)=>{if(setStatus)setStatus(msg,type||'ok');if(autoBar)autoBar.textContent=msg;};
+        const PRESENT_SEL=['iframe[src*="hcaptcha.com"]','.h-captcha','iframe[src*="recaptcha"]','.g-recaptcha','iframe[src*="challenges.cloudflare.com"]','.cf-turnstile'].join(',');
+
+        function isSolved(){
+            for(const s of['textarea[id^="h-captcha-response"]','textarea[name="h-captcha-response"]','textarea[id^="g-recaptcha-response"]','textarea[name="g-recaptcha-response"]']){
+                const el=document.querySelector(s);if(el&&el.value&&el.value.length>10)return true;
+            }
+            for(const s of['input[name="cf-turnstile-response"]','input[name="cf_turnstile_response"]']){
+                const el=document.querySelector(s);if(el&&el.value&&el.value.length>10)return true;
+            }
+            return false;
+        }
+
+        // [SỬA] Tìm nút "Xác Nhận Và Tiếp Tục" không bị disabled
+        function findXacNhanBtn() {
+            // Tìm chính xác theo text "Xác Nhận Và Tiếp Tục" hoặc "Xác Nhận"
+            const allSubmit = [...document.querySelectorAll('button[type="submit"]')].filter(b => {
+                if (b.disabled) return false;
+                if (b.offsetParent === null) return false;
+                return true;
+            });
+            // Ưu tiên button có text "Xác Nhận Và Tiếp Tục"
+            const xacNhanTiepTuc = allSubmit.find(b => {
+                const t = (b.innerText || b.textContent || '').trim();
+                return t.includes('Xác Nhận Và Tiếp Tục') || t.includes('Xac Nhan Va Tiep Tuc');
+            });
+            if (xacNhanTiepTuc) return xacNhanTiepTuc;
+            // Fallback: text "Xác Nhận"
+            const xacNhan = allSubmit.find(b => {
+                const t = (b.innerText || b.textContent || '').trim();
+                return t.includes('Xác Nhận') || t.includes('xac nhan');
+            });
+            if (xacNhan) return xacNhan;
+            // Fallback cuối: bất kỳ submit visible không disabled
+            return allSubmit[0] || null;
+        }
+
+        async function onSolved(){
+            if(solved)return; solved=true;
+            log('✅ Captcha solved! Đang tìm nút...');
+            await sleep(700);
+
+            // [SỬA] Chờ nút "Xác Nhận Và Tiếp Tục" xuất hiện và enabled (tối đa 15s)
+            let xacNhanBtn = null;
+            const deadline = Date.now() + 15000;
+            while (Date.now() < deadline) {
+                xacNhanBtn = findXacNhanBtn();
+                if (xacNhanBtn) break;
+                await sleep(300);
+            }
+
+            if (xacNhanBtn) {
+                await sleep(400);
+                simClick(xacNhanBtn);
+                log('✅ Đã click "Xác Nhận Và Tiếp Tục"', 'ok');
+                // Sau khi click nút xác nhận, chờ và tìm nút tiếp theo (#submit-button cũ)
+                await sleep(1500);
+                await _afterXacNhan(log);
+            } else {
+                log('❌ Không thấy nút Xác Nhận', 'err');
+            }
+        }
+
+        function startWatching(){
+            if(watching)return; watching=true; solved=false;
+            log('⏳ Chờ giải captcha...');
+            const iv=setInterval(()=>{
+                if(isSolved()){
+                    clearInterval(iv); watching=false;
+                    if(solvedTimer)clearTimeout(solvedTimer);
+                    solvedTimer=setTimeout(()=>onSolved(),300);
+                }
+            },600);
+            setTimeout(()=>{clearInterval(iv);watching=false;},300000);
+        }
+
+        const obs=new MutationObserver(()=>{
+            const has=!!document.querySelector(PRESENT_SEL);
+            if(has) startWatching();
+            else if(!has&&watching){watching=false;solved=false;if(solvedTimer){clearTimeout(solvedTimer);solvedTimer=null;}}
+        });
+        obs.observe(document.body,{childList:true,subtree:true,attributes:true});
+        if(document.querySelector(PRESENT_SEL)) startWatching();
+    }
+
+    // [MỚI] Sau khi click "Xác Nhận Và Tiếp Tục", xử lý bước tiếp theo
+    async function _afterXacNhan(log) {
+        // Chờ trang chuyển hoặc nút tiếp theo xuất hiện (tối đa 20s)
+        const deadline = Date.now() + 20000;
+        while (Date.now() < deadline) {
+            // Tìm nút #submit-button (nút tiếp tục cũ trong flow)
+            const sub = document.querySelector('#submit-button');
+            if (sub && sub.offsetParent !== null && !sub.disabled) {
+                await sleep(400);
+                simClick(sub);
+                if (log) log('✅ Hoàn tất!', 'ok');
+                const autoBar = document.getElementById && document.querySelector('#ocr-autobar-nm');
+                if (autoBar) autoBar.style.display = 'none';
+                return;
+            }
+            // Kiểm tra nếu trang đã chuyển hướng hoặc thành công
+            const successEl = document.querySelector('[class*="success"],[class*="complete"],[class*="done"]');
+            if (successEl && successEl.offsetParent !== null) {
+                if (log) log('✅ Hoàn tất!', 'ok');
+                return;
+            }
+            await sleep(500);
+        }
+        if (log) log('⏳ Chờ bước tiếp theo...', '');
+    }
+
+    // ─── UI ───────────────────────────────────────────────────────────────
+    function createUI() {
+        const fontLink=document.createElement('link');
+        fontLink.rel='stylesheet';
+        fontLink.href='https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Share+Tech+Mono&family=Rajdhani:wght@500;700&display=swap';
+        document.head.appendChild(fontLink);
+
+        GM_addStyle(`
+        #ocr-shell-nm *, #ocr-shell-nm *::before, #ocr-shell-nm *::after { box-sizing:border-box; }
+        #ocr-shell-nm {
+            --c1:#ff6600; --c2:#ff2d78; --c3:#7c3aed; --c4:#00e676;
+            --bg0:#07070f; --bg1:#0d0d1a; --bg2:#12121f; --bg3:#1a1a2e;
+            --border:rgba(255,102,0,.18); --shadow:0 8px 32px rgba(0,0,0,.7),0 0 0 1px rgba(255,102,0,.08);
+            position:fixed; top:55px; right:12px; width:230px;
+            background:var(--bg0); border:1px solid var(--border); border-radius:14px;
+            z-index:999999; overflow:hidden; box-shadow:var(--shadow);
+            transition:width .22s cubic-bezier(.4,0,.2,1); min-width:140px;
+            font-family:'Rajdhani',sans-serif; backdrop-filter:blur(12px);
+        }
+        #ocr-shell-nm::before { content:''; position:absolute; left:0; right:0; top:-100%; height:2px;
+            background:linear-gradient(90deg,transparent,var(--c1),transparent); opacity:.35;
+            animation:scanNM 4s ease-in-out infinite; pointer-events:none; z-index:1000; }
+        @keyframes scanNM { 0%{top:-5px;opacity:0} 5%{opacity:.35} 95%{opacity:.35} 100%{top:105%;opacity:0} }
+        #ocr-hdr-nm { display:flex; align-items:center; justify-content:space-between; padding:8px 10px 7px;
+            background:linear-gradient(90deg,rgba(255,102,0,.06),rgba(124,58,237,.06),rgba(255,45,120,.06));
+            border-bottom:1px solid var(--border); cursor:move; user-select:none; touch-action:none; position:relative; z-index:10; }
+        #ocr-logo-nm { display:flex; align-items:center; gap:7px; }
+        .ocr-pulse-nm { width:6px; height:6px; border-radius:50%; background:var(--c1);
+            box-shadow:0 0 8px var(--c1),0 0 16px rgba(255,102,0,.4); animation:pulseNM 1.8s ease-in-out infinite; }
+        @keyframes pulseNM { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.35;transform:scale(.6)} }
+        #ocr-title-nm { font-family:'Orbitron',monospace; font-size:8px; font-weight:700; color:var(--c1); letter-spacing:2px; text-shadow:0 0 10px rgba(255,102,0,.5); }
+        #ocr-ver-nm   { font-family:'Share Tech Mono',monospace; font-size:7px; color:rgba(255,45,120,.7); letter-spacing:1px; }
+        .ocr-hdr-right-nm { display:flex; align-items:center; gap:4px; }
+        .ocr-sz-nm { background:var(--bg3); border:1px solid rgba(255,102,0,.1); border-radius:4px; color:#444; width:18px; height:18px; font-size:8px; font-weight:700; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:all .15s; font-family:'Orbitron',monospace; }
+        .ocr-sz-nm:hover, .ocr-sz-nm.active { background:rgba(255,102,0,.15); color:var(--c1); border-color:rgba(255,102,0,.4); }
+        #ocr-close-nm { background:var(--bg3); border:1px solid rgba(255,45,120,.15); border-radius:4px; color:#555; width:18px; height:18px; font-size:9px; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:all .15s; }
+        #ocr-close-nm:hover { background:rgba(255,45,120,.15); color:var(--c2); }
+        #ocr-body-nm { padding:8px 9px 7px; display:flex; flex-direction:column; gap:6px; position:relative; z-index:10; }
+        .ocr-lbl-nm { font-family:'Share Tech Mono',monospace; font-size:7px; color:rgba(255,102,0,.5); letter-spacing:2px; text-transform:uppercase; margin-bottom:2px; }
+        #ocr-shell-nm input[type=text] { width:100%; background:var(--bg2); border:1px solid rgba(255,102,0,.15); border-radius:6px; color:var(--c1); font-family:'Share Tech Mono',monospace; font-size:9.5px; padding:5px 7px; outline:none; transition:border-color .2s; }
+        #ocr-shell-nm input[type=text]:focus { border-color:rgba(255,102,0,.4); box-shadow:0 0 0 2px rgba(255,102,0,.08); }
+        #ocr-ai-status-nm { background:rgba(255,102,0,.04); border:1px solid rgba(255,102,0,.12); border-radius:8px; padding:7px 9px; font-family:'Share Tech Mono',monospace; font-size:8px; color:#555; min-height:24px; word-break:break-all; display:none; }
+        #ocr-ai-status-nm.active { display:block; color:var(--c1); }
+        #ocr-ai-status-nm.ok  { display:block; color:var(--c4); }
+        #ocr-ai-status-nm.err { display:block; color:var(--c2); }
+        .ocr-btn-row-nm { display:flex; gap:5px; }
+        .ocr-btn-nm { flex:1; padding:6px 0; border-radius:7px; border:1px solid transparent; font-family:'Orbitron',monospace; font-weight:700; font-size:8px; letter-spacing:1px; cursor:pointer; transition:all .18s; }
+        .ocr-btn-nm:active { transform:scale(.96); }
+        .ocr-btn-nm:hover  { filter:brightness(1.15); }
+        #ocr-btn-imgs-nm { background:linear-gradient(135deg,#1a237e,#1565c0); color:#90caf9; border-color:rgba(66,165,245,.25); }
+        #ocr-btn-ocr-nm  { background:linear-gradient(135deg,#7c3aed,#4f46e5); color:#c4b5fd; border-color:rgba(124,58,237,.3); }
+        #ocr-btn-open-nm { background:linear-gradient(135deg,#ff6600,#ff3300); color:#fff; border-color:rgba(255,102,0,.4); box-shadow:0 2px 12px rgba(255,102,0,.3); }
+        .ocr-io-row-nm   { display:flex; gap:5px; }
+        .ocr-io-btn-nm   { flex:1; padding:4px 0; border-radius:6px; font-family:'Share Tech Mono',monospace; font-size:9px; cursor:pointer; transition:all .18s; display:flex; align-items:center; justify-content:center; gap:3px; }
+        #ocr-btn-export-nm { background:linear-gradient(135deg,rgba(26,35,126,.7),rgba(40,53,147,.7)); color:#90caf9; border:1px solid rgba(66,165,245,.2); }
+        #ocr-btn-import-nm { background:linear-gradient(135deg,rgba(27,94,32,.7),rgba(46,125,50,.7)); color:#a5d6a7; border:1px solid rgba(102,187,106,.2); }
+        .ocr-scroll-nm { max-height:110px; overflow-y:auto; background:var(--bg2); border:1px solid var(--border); border-radius:7px; padding:4px 5px; scrollbar-width:thin; }
+        #ocr-imglist-nm { display:none; }
+        .ocr-img-row-nm { background:var(--bg3); border:1px solid rgba(255,102,0,.1); border-radius:6px; padding:5px 6px; margin-bottom:4px; }
+        .ocr-img-url-input-nm { width:100%; background:rgba(0,0,0,.3); border:1px solid rgba(255,102,0,.2); border-radius:4px; color:var(--c1); font-family:'Share Tech Mono',monospace; font-size:8.5px; padding:3px 5px; margin:3px 0; outline:none; }
+        .ocr-img-btn-row-nm { display:flex; gap:3px; margin-top:3px; }
+        .ocr-img-btn-nm { flex:1; background:rgba(255,102,0,.08); border:1px solid rgba(255,102,0,.2); border-radius:4px; color:var(--c1); font-size:7.5px; padding:2px 0; cursor:pointer; font-family:'Share Tech Mono',monospace; transition:all .15s; }
+        .ocr-img-btn-del-nm { background:rgba(255,45,120,.06); border-color:rgba(255,45,120,.15); color:var(--c2); }
+        .ocr-clr-btn-nm { width:100%; margin-top:4px; background:rgba(255,45,120,.05); border:1px solid rgba(255,45,120,.15); border-radius:5px; color:var(--c2); font-family:'Orbitron',monospace; font-weight:700; font-size:8px; padding:4px; cursor:pointer; letter-spacing:1px; }
+        #ocr-cand-box-nm { display:none; max-height:56px; overflow-y:auto; background:var(--bg2); border:1px solid rgba(255,102,0,.15); border-radius:6px; padding:3px 5px; }
+        .ocr-cand-nm { font-family:'Share Tech Mono',monospace; font-size:8px; color:#555; cursor:pointer; padding:2px 0; border-bottom:1px solid rgba(255,255,255,.03); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .ocr-cand-nm:hover { color:var(--c1); }
+        #ocr-status-nm { font-family:'Share Tech Mono',monospace; font-size:8px; color:#444; text-align:center; min-height:14px; word-break:break-all; padding:0 2px; transition:color .2s; }
+        #ocr-status-nm.ok  { color:var(--c4); text-shadow:0 0 8px rgba(0,230,118,.25); }
+        #ocr-status-nm.err { color:var(--c2); }
+        #ocr-cache-nm { display:none; background:rgba(0,230,118,.07); border:1px solid rgba(0,230,118,.2); border-radius:6px; padding:4px 7px; font-family:'Share Tech Mono',monospace; font-size:7.5px; color:var(--c4); text-align:center; }
+        #ocr-autobar-nm { display:none; background:linear-gradient(90deg,rgba(255,102,0,.05),rgba(124,58,237,.05)); border-top:1px solid var(--border); padding:5px 10px; font-family:'Share Tech Mono',monospace; font-size:7.5px; color:var(--c1); text-align:center; letter-spacing:.8px; }
+        #ocr-shell-nm.sz-s { width:160px; }
+        #ocr-shell-nm.sz-l { width:340px; }
+        .ocr-divider-nm { height:1px; background:linear-gradient(90deg,transparent,rgba(255,102,0,.15),transparent); margin:1px 0; }
+        @keyframes foundGlowNM { 0%,100%{box-shadow:var(--shadow)} 50%{box-shadow:0 8px 40px rgba(0,0,0,.8),0 0 0 1px rgba(0,230,118,.3),0 0 30px rgba(0,230,118,.1)} }
+        #ocr-shell-nm.found-nm { animation:foundGlowNM 1.5s ease-in-out 3; }
+        `);
+
+        const shell=document.createElement('div'); shell.id='ocr-shell-nm';
+        shell.innerHTML=`
+        <div id="ocr-hdr-nm">
+            <div id="ocr-logo-nm">
+                <div class="ocr-pulse-nm"></div>
+                <div><div id="ocr-title-nm">NHAPMA</div><div id="ocr-ver-nm">AI VISION v1</div></div>
+            </div>
+            <div class="ocr-hdr-right-nm">
+                <button class="ocr-sz-nm" data-sz="s">S</button>
+                <button class="ocr-sz-nm active" data-sz="m">M</button>
+                <button class="ocr-sz-nm" data-sz="l">L</button>
+                <button id="ocr-close-nm">X</button>
+            </div>
+        </div>
+        <div id="ocr-body-nm">
+            <div id="ocr-cache-nm">URL có sẵn (cache) – nhấn OPEN</div>
+            <div>
+                <div class="ocr-lbl-nm">URL</div>
+                <input id="ocr-url-box-nm" type="text" placeholder="https://..."/>
+            </div>
+            <div id="ocr-ai-status-nm">Sẵn sàng quét AI...</div>
+            <div id="ocr-cand-box-nm"></div>
+            <div class="ocr-btn-row-nm">
+                <button id="ocr-btn-imgs-nm" class="ocr-btn-nm">IMGS</button>
+                <button id="ocr-btn-ocr-nm"  class="ocr-btn-nm">AI SCAN</button>
+                <button id="ocr-btn-open-nm" class="ocr-btn-nm">OPEN</button>
+            </div>
+            <div class="ocr-divider-nm"></div>
+            <div class="ocr-io-row-nm">
+                <button id="ocr-btn-export-nm" class="ocr-io-btn-nm">Xuất</button>
+                <button id="ocr-btn-import-nm" class="ocr-io-btn-nm">Nhập</button>
+                <input id="ocr-import-file-nm" type="file" accept=".json" style="display:none">
+            </div>
+            <div id="ocr-imglist-nm" class="ocr-scroll-nm"></div>
+            <div id="ocr-status-nm"></div>
+        </div>
+        <div id="ocr-autobar-nm">Đang chờ code từ tab phụ...</div>`;
+        document.body.appendChild(shell);
+
+        const statusEl   = shell.querySelector('#ocr-status-nm');
+        const aiStatusEl = shell.querySelector('#ocr-ai-status-nm');
+        const urlBox     = shell.querySelector('#ocr-url-box-nm');
+        const imgListBox = shell.querySelector('#ocr-imglist-nm');
+        const autoBar    = shell.querySelector('#ocr-autobar-nm');
+        const cacheBadge = shell.querySelector('#ocr-cache-nm');
+        const importFile = shell.querySelector('#ocr-import-file-nm');
+
+        const setStatus=(msg,type='')=>{
+            statusEl.textContent=msg; statusEl.className=type;
+            aiStatusEl.textContent=msg; aiStatusEl.className=type?`active ${type}`:'active';
+            if(type==='ok'){shell.classList.add('found-nm');setTimeout(()=>shell.classList.remove('found-nm'),4500);}
+        };
+
+        window._ocrUI={urlBox,autoBar,setStatus,selectedImgKey:null,lastScannedImgKey:null,lastScannedImgSrc:null};
+
+        // Size buttons
+        shell.querySelectorAll('.ocr-sz-nm').forEach(b=>{
+            b.onclick=()=>{
+                const sz=b.dataset.sz;
+                shell.style.width=(sz==='s'?160:sz==='l'?340:230)+'px';
+                shell.className='sz-'+sz;
+                shell.querySelectorAll('.ocr-sz-nm').forEach(x=>x.classList.toggle('active',x.dataset.sz===sz));
+            };
+        });
+        shell.querySelector('#ocr-close-nm').onclick=()=>{
+            // Hủy auto-open khi đóng UI
+            if (window._ocrAutoOpenTimer) { clearInterval(window._ocrAutoOpenTimer); window._ocrAutoOpenTimer=null; }
+            shell.remove();
+        };
+
+        // Drag
+        let drag=false, ox=0, oy=0;
+        const hdr=shell.querySelector('#ocr-hdr-nm');
+        hdr.onmousedown=e=>{drag=true;ox=e.clientX-shell.offsetLeft;oy=e.clientY-shell.offsetTop;};
+        hdr.addEventListener('touchstart',e=>{const t=e.touches[0];drag=true;ox=t.clientX-shell.offsetLeft;oy=t.clientY-shell.offsetTop;},{passive:true});
+        document.addEventListener('mouseup',()=>drag=false);
+        document.addEventListener('touchend',()=>drag=false);
+        document.addEventListener('mousemove',e=>{if(!drag)return;shell.style.left=e.clientX-ox+'px';shell.style.top=e.clientY-oy+'px';shell.style.right='auto';});
+        document.addEventListener('touchmove',e=>{if(!drag)return;const t=e.touches[0];shell.style.left=t.clientX-ox+'px';shell.style.top=t.clientY-oy+'px';shell.style.right='auto';},{passive:true});
+
+        // IMGS
+        shell.querySelector('#ocr-btn-imgs-nm').onclick=()=>{
+            const visible=imgListBox.style.display==='block';
+            imgListBox.style.display=visible?'none':'block';
+            if(!visible)renderImgList();
+        };
+
+        function renderImgList(){
+            const m=getImgMap(),keys=Object.keys(m);
+            if(!keys.length){imgListBox.innerHTML='<div style="color:#555;font-size:9px;text-align:center;padding:6px;font-family:Share Tech Mono,monospace">Chưa có ảnh nào</div>';return;}
+            keys.sort((a,b)=>(m[b].lastSeen||0)-(m[a].lastSeen||0));
+            imgListBox.innerHTML=keys.map(k=>{
+                const entry=m[k],name=k.split('/').pop().substring(0,22);
+                const ek=k.replace(/"/g,'&quot;').replace(/'/g,"\\'");
+                return `<div class="ocr-img-row-nm">
+                    <div style="display:flex;justify-content:space-between;margin-bottom:2px">
+                        <span style="color:#555;font-size:7.5px;font-family:'Share Tech Mono',monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:80%">${name}</span>
+                        <span style="color:#333;font-size:7px;font-family:'Share Tech Mono',monospace">${entry.count||1}x</span>
+                    </div>
+                    <input type="text" class="ocr-img-url-input-nm" value="${entry.url.replace(/"/g,'&quot;')}" placeholder="URL...">
+                    <div class="ocr-img-btn-row-nm">
+                        <button class="ocr-img-btn-nm" onclick="(function(){var r=this.closest('.ocr-img-row-nm');var i=r.querySelector('.ocr-img-url-input-nm');document.getElementById('ocr-url-box-nm').value=i.value;window._ocrUI.selectedImgKey='${ek}';}).call(this)">Dùng</button>
+                        <button class="ocr-img-btn-nm" onclick="(function(){var r=this.closest('.ocr-img-row-nm');var i=r.querySelector('.ocr-img-url-input-nm');var mm=JSON.parse(localStorage.getItem('${IMG_MAP_KEY}')||'{}');if(mm['${ek}']){mm['${ek}'].url=i.value.trim();mm['${ek}'].lastSeen=Date.now();localStorage.setItem('${IMG_MAP_KEY}',JSON.stringify(mm));}}).call(this)">Lưu</button>
+                        <button class="ocr-img-btn-nm ocr-img-btn-del-nm" onclick="(function(){var mm=JSON.parse(localStorage.getItem('${IMG_MAP_KEY}')||'{}');delete mm['${ek}'];localStorage.setItem('${IMG_MAP_KEY}',JSON.stringify(mm));if(window._ocrUI.selectedImgKey==='${ek}')window._ocrUI.selectedImgKey=null;this.closest('.ocr-img-row-nm').remove();}).call(this)">X</button>
+                    </div></div>`;
+            }).join('')+`<button class="ocr-clr-btn-nm" onclick="localStorage.removeItem('${IMG_MAP_KEY}');window._ocrUI.selectedImgKey=null;document.getElementById('ocr-imglist-nm').innerHTML='<div style=color:#555;font-size:9px;text-align:center;padding:6px>Đã xóa</div>'">XÓA TẤT CẢ</button>`;
+        }
+
+        // AI SCAN (thủ công – không auto-open)
+        shell.querySelector('#ocr-btn-ocr-nm').onclick=async()=>{
+            // Hủy auto-open đang chờ (nếu có)
+            if (window._ocrAutoOpenTimer) { clearInterval(window._ocrAutoOpenTimer); window._ocrAutoOpenTimer=null; }
+            const openBtn=shell.querySelector('#ocr-btn-open-nm');
+            if(openBtn)openBtn.textContent='OPEN';
+            imgListBox.style.display='none';
+            shell.querySelector('#ocr-cand-box-nm').style.display='none';
+            cacheBadge.style.display='none';
+            setStatus('🔄 Bắt đầu AI Scan...','');
+            // Truyền autoOpen=false khi người dùng bấm thủ công
+            await runAIScan(setStatus,urlBox,false);
+        };
+
+        // OPEN
+        shell.querySelector('#ocr-btn-open-nm').onclick=()=>{
+            // Hủy timer đếm ngược nếu đang chạy
+            if (window._ocrAutoOpenTimer) { clearInterval(window._ocrAutoOpenTimer); window._ocrAutoOpenTimer=null; }
+            const openBtn=shell.querySelector('#ocr-btn-open-nm');
+            if(openBtn)openBtn.textContent='OPEN';
+
+            let url=urlBox.value.trim();
+            if(!url){setStatus('Nhập URL trước!','err');return;}
+            if(!url.startsWith('http'))url='https://'+url;
+            let saved=false;
+            if(window._ocrUI.selectedImgKey){
+                const mm=getImgMap(),key=window._ocrUI.selectedImgKey;
+                if(mm[key]&&mm[key].url!==url){mm[key].url=url;mm[key].lastSeen=Date.now();saveImgMap(mm);if(imgListBox.style.display==='block')renderImgList();saved=true;}
+            } else if(window._ocrUI.lastScannedImgKey&&window._ocrUI.lastScannedImgSrc){
+                const mm=getImgMap(),key=window._ocrUI.lastScannedImgKey;
+                if(!mm[key]||mm[key].url!==url){saveImgURL(window._ocrUI.lastScannedImgSrc,url,1);window._ocrUI.selectedImgKey=key;saved=true;}
+            }
+            setStatus(saved?'Saved & opened!':'Opened!','ok');
+            addURL(url);
+            window.open('https://www.google.com/url?q='+encodeURIComponent(url),TAB_NAME);
+            autoBar.style.display='block';
+            autoBar.textContent='Chờ code từ tab phụ...';
+        };
+
+        // Export / Import
+        shell.querySelector('#ocr-btn-export-nm').onclick=()=>{try{exportData();setStatus('Đã xuất file','ok');}catch(e){setStatus('Lỗi: '+e.message,'err');}};
+        shell.querySelector('#ocr-btn-import-nm').onclick=()=>{importFile.value='';importFile.click();};
+        importFile.onchange=()=>{
+            const file=importFile.files[0];if(!file)return;
+            setStatus('Đang nhập...','');
+            importData(file,(msg,type)=>{setStatus(msg,type);if(imgListBox.style.display==='block')renderImgList();});
+        };
+
+        startCodeListener(setStatus,autoBar);
+        startCaptchaWatcher(setStatus,autoBar);
+        startCountdownWatcher();
+
+        // ─── AUTO-SCAN khi tải trang (với auto-open) ────────────────────
+        setTimeout(async()=>{
+            const ui=window._ocrUI; if(!ui) return;
+
+            // Kiểm tra cache trước
+            for(const img of document.images){
+                const cached=lookupImgURL(img.src);
+                if(cached){
+                    ui.urlBox.value=cached;
+                    ui.selectedImgKey=normKey(img.src);
+                    ui.lastScannedImgKey=normKey(img.src);
+                    ui.lastScannedImgSrc=img.src;
+                    cacheBadge.style.display='block';
+                    // Cache hit → auto-open với đếm ngược
+                    _triggerAutoOpen(cached);
+                    return;
+                }
+            }
+
+            // Không có cache → AI scan và auto-open khi tìm ra URL
+            await runAIScan(setStatus, ui.urlBox, true);
+        },2500);
+    }
+
+    // ─── CODE LISTENER (tab chính) ────────────────────────────────────────
+    function startCodeListener(setStatus, autoBar) {
+        localStorage.removeItem(CODE_KEY);
+        window.addEventListener('storage', async e=>{
+            if(e.key!==CODE_KEY||!e.newValue)return;
+            const code=e.newValue;localStorage.removeItem(CODE_KEY);
+            if(autoBar){autoBar.style.display='block';autoBar.textContent=`Code: ${code}`;}
+            if(setStatus)setStatus(`Code: ${code}`,'ok');
+            await autoFillCode(code,setStatus,autoBar);
+        });
+        window.addEventListener('message',e=>{
+            if(!e.data||e.data.type!=='OCR_CODE'||!e.data.code)return;
+            const code=e.data.code;
+            localStorage.setItem(CODE_KEY,code);
+            window.dispatchEvent(new StorageEvent('storage',{key:CODE_KEY,newValue:code,storageArea:localStorage}));
+        });
+    }
+
+    // ─── AUTO FILL CODE (tab chính) ──────────────────────────────────────
+    async function autoFillCode(code, setStatus, autoBar) {
+        const log=(msg,type)=>{if(setStatus)setStatus(msg,type||'ok');if(autoBar)autoBar.textContent=msg;};
+        log('Đang điền mã...');
+
+        const inp = document.querySelector('input[name="code"][data-v-9b370738]') ||
+                    document.querySelector('input[name="code"]');
+        if(!inp){log('Không tìm thấy ô mã','err');return;}
+
+        const setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
+        setter.call(inp,code);
+        ['input','change','keyup'].forEach(ev=>inp.dispatchEvent(new Event(ev,{bubbles:true})));
+        inp.focus(); log(`Đã điền: ${code}`);
+
+        await sleep(800);
+        log('Click Xác Nhận...');
+
+        const confirmBtn = findNhapmaConfirmBtn();
+        if(confirmBtn){simClick(confirmBtn);log('Click Xác Nhận');}
+        else{log('Không thấy nút Xác Nhận','err');}
+
+        await sleep(1200);
+
+        // Kiểm tra captcha
+        const captchaEl=document.querySelector('iframe[src*="hcaptcha"],iframe[src*="recaptcha"],iframe[src*="challenges.cloudflare.com"],.h-captcha,.g-recaptcha,.cf-turnstile');
+        if(!captchaEl){
+            await sleep(2500);
+            const errEl=document.querySelector('.alert-error,[class*="error"],[class*="invalid"]');
+            if(errEl&&errEl.offsetParent!==null){
+                const t=(errEl.innerText||errEl.textContent||'').toLowerCase();
+                if(t.includes('không đúng')||t.includes('sai')||t.includes('invalid')||t.includes('incorrect')){log('Mã sai!','err');return;}
+            }
+            log('Chờ nút Tiếp Tục...');
+            // [SỬA] Tìm nút "Xác Nhận Và Tiếp Tục" enabled (sau khi không có captcha)
+            const xacNhanBtn = await waitForEnabledSubmitBtn(15000);
+            if(xacNhanBtn){await sleep(400);simClick(xacNhanBtn);log('Hoàn tất!','ok');if(autoBar)autoBar.style.display='none';}
+            else log('Không thấy nút Tiếp Tục','err');
+        } else {
+            log('Chờ giải captcha...');
+        }
+    }
+
+    // [MỚI] Chờ nút submit enabled (không disabled)
+    function waitForEnabledSubmitBtn(timeout=15000) {
+        return new Promise(resolve=>{
+            const find=()=>{
+                // Tìm "Xác Nhận Và Tiếp Tục" enabled
+                const btns=[...document.querySelectorAll('button[type="submit"]')].filter(b=>!b.disabled&&b.offsetParent!==null);
+                const xacNhan=btns.find(b=>{const t=(b.innerText||b.textContent||'').trim();return t.includes('Xác Nhận')||t.includes('Tiếp Tục');});
+                return xacNhan||btns[0]||null;
+            };
+            const el=find(); if(el){resolve(el);return;}
+            const obs=new MutationObserver(()=>{const el=find();if(el){obs.disconnect();resolve(el);}});
+            obs.observe(document.body,{childList:true,subtree:true,attributes:true,attributeFilter:['disabled']});
+            setTimeout(()=>{obs.disconnect();resolve(null);},timeout);
+        });
+    }
+
+    function findNhapmaConfirmBtn() {
+        // [SỬA] Tìm button "Xác Nhận Và Tiếp Tục" hoặc "Xác Nhận" không disabled
+        const allBtns=[...document.querySelectorAll('button[type="submit"]')].filter(b=>b.offsetParent!==null&&!b.disabled);
+        const xacNhanTiepTuc=allBtns.find(b=>{const t=(b.innerText||b.textContent||'').trim();return t.includes('Xác Nhận Và Tiếp Tục');});
+        if(xacNhanTiepTuc)return xacNhanTiepTuc;
+        const xacNhan=allBtns.find(b=>{const t=(b.innerText||b.textContent||'').trim();return t.includes('Xác Nhận')||t.includes('xac nhan');});
+        if(xacNhan)return xacNhan;
+        return allBtns[0]||null;
+    }
+
+    function waitForElement(selector, timeout=10000) {
+        return new Promise(resolve=>{
+            const check=()=>{const el=document.querySelector(selector);if(el&&el.offsetParent!==null){resolve(el);}};
+            check();
+            const obs=new MutationObserver(check);
+            obs.observe(document.body,{childList:true,subtree:true,attributes:true});
+            setTimeout(()=>{obs.disconnect();resolve(null);},timeout);
+        });
+    }
+
+    function simClick(el) {
+        if(!el)return;
+        el.scrollIntoView({behavior:'smooth',block:'center'});el.focus();
+        ['pointerdown','mousedown','pointerup','mouseup'].forEach(ev=>el.dispatchEvent(new(ev.startsWith('pointer')?PointerEvent:MouseEvent)(ev,{bubbles:true,cancelable:true})));
+        el.click();
+    }
+
+    function showToast(msg) {
+        let t=document.getElementById('nhapma-toast-v1');
+        if(t)t.remove();
+        t=document.createElement('div');t.id='nhapma-toast-v1';t.textContent=msg;
+        t.style.cssText='position:fixed;bottom:30px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,#0d0d1a,#12121f);border:1px solid rgba(255,102,0,.4);color:#ff6600;font-family:"Share Tech Mono",monospace;font-size:12px;padding:12px 24px;border-radius:12px;z-index:9999999;box-shadow:0 4px 32px rgba(0,0,0,.6);white-space:pre-line;text-align:center;line-height:1.7;backdrop-filter:blur(8px);min-width:200px;';
+        document.body.appendChild(t);
+        clearTimeout(t._timer);
+        t._timer=setTimeout(()=>{t.style.transition='opacity .4s';t.style.opacity='0';setTimeout(()=>t.remove(),400);},4000);
+    }
+
+    // ─── FLOW CHO TAB PHỤ (web đích) ─────────────────────────────────────
+    function findAngularBtnFirst() {
+        for(const btn of document.querySelectorAll('button')){
+            if(btn.offsetParent===null||btn.disabled)continue;
+            const imgs=btn.querySelectorAll('img');
+            for(const img of imgs){
+                if((img.src||'').includes('angular-icon.svg')){
+                    const bg=window.getComputedStyle(btn).backgroundColor;
+                    if(bg==='transparent'||bg==='rgba(0, 0, 0, 0)'||bg.includes('0, 0, 0, 0'))return btn;
+                }
+            }
+        }
+        for(const btn of document.querySelectorAll('button')){
+            if(btn.offsetParent===null)continue;
+            for(const img of btn.querySelectorAll('img')){
+                if((img.src||'').includes('angular-icon.svg'))return btn;
+            }
+        }
+        return null;
+    }
+
+    function findAngularBtnOrange() {
+        for(const btn of document.querySelectorAll('button')){
+            if(btn.offsetParent===null)continue;
+            const text=(btn.innerText||btn.textContent||'');
+            if(!text.includes('(1/1)'))continue;
+            const imgs=btn.querySelectorAll('img');
+            for(const img of imgs){
+                if((img.src||'').includes('angular-icon.svg'))return btn;
+            }
+            const bg=window.getComputedStyle(btn).backgroundColor;
+            if(bg.includes('255, 102, 0')||bg.includes('255,102,0'))return btn;
+        }
+        return null;
+    }
+
+    function getCountdownData() {
+        const el=document.querySelector('[data-click="true"][data-time]');
+        if(el){const v=parseInt(el.getAttribute('data-time'));if(v>0&&v<3600)return{el,sec:v};}
+        for(const e of document.querySelectorAll('[data-time]')){
+            const v=parseInt(e.getAttribute('data-time'));
+            if(v>0&&v<3600)return{el:e,sec:v};
+        }
+        return null;
+    }
+
+    function extractCodeFromPage() {
+        const ORANGE_RE=/rgb\(255,\s*102,\s*0\)/;
+        for(const el of document.querySelectorAll('div,span,button,p')){
+            if(el.offsetParent===null)continue;
+            const text=(el.textContent||'').trim();
+            if(!/^[A-Z0-9]{4,12}$/.test(text))continue;
+            const bg=window.getComputedStyle(el).backgroundColor.replace(/\s/g,'');
+            if(ORANGE_RE.test(bg))return text;
+            const rgb=bg.match(/rgb\((\d+),(\d+),(\d+)\)/);
+            if(rgb){const r=parseInt(rgb[1]),g=parseInt(rgb[2]),b=parseInt(rgb[3]);if(r>200&&g>50&&g<150&&b<50)return text;}
+        }
+        for(const el of document.querySelectorAll('div,span')){
+            if(el.offsetParent===null)continue;
+            const text=(el.textContent||'').trim();
+            if(/^[A-Z0-9]{6,12}$/.test(text)){
+                const parent=el.parentElement;
+                if(parent&&parent.children.length<=3)return text;
+            }
+        }
+        return null;
+    }
+
+    async function clickOnTargetSite() {
+        preventThrottling();
+        showToast('Trang tải, chờ 4s...'); await workerSleep(4000);
+
+        let btn1=null;
+        for(let i=0;i<20;i++){btn1=findAngularBtnFirst();if(btn1)break;await workerSleep(1000);showToast(`Chờ nút Angular... (${i+1}/20)`);}
+        if(!btn1){showToast('Không tìm thấy nút Angular!');return;}
+        showToast('Tìm thấy nút Angular, click lần 1...');
+        simClick(btn1);
+        await workerSleep(1500);
+
+        let btn2=null;
+        for(let i=0;i<20;i++){btn2=findAngularBtnOrange();if(btn2)break;await workerSleep(1000);}
+        if(!btn2){showToast('Nút cam (1/1) không tìm thấy!');return;}
+        showToast('Click nút cam (1/1)...');
+        await workerSleep(800);
+        simClick(btn2);
+        await workerSleep(1000);
+
+        let countdownSec=0;
+        for(let attempt=0;attempt<60;attempt++){
+            await workerSleep(500);
+            const found=getCountdownData();
+            if(found){countdownSec=found.sec;break;}
+        }
+        if(!countdownSec){showToast('Không đọc được data-time!');return;}
+
+        const endTime=Date.now()+countdownSec*1000;
+        try{
+            localStorage.setItem(COUNTDOWN_KEY,endTime.toString());
+            if(window.opener&&!window.opener.closed)window.opener.localStorage.setItem(COUNTDOWN_KEY,endTime.toString());
+        }catch(_){}
+
+        showToast(`Đếm ngược: ${countdownSec}s`);
+
+        await workerSleep(countdownSec*1000, remMs=>{
+            const remSec=Math.ceil(remMs/1000);
+            showToast(`⏳ ${remSec}s...`);
+        });
+
+        try{localStorage.removeItem(COUNTDOWN_KEY);if(window.opener&&!window.opener.closed)window.opener.localStorage.removeItem(COUNTDOWN_KEY);}catch(_){}
+
+        showToast('Hết giờ! Tìm code...');
+        await workerSleep(1500);
+
+        const btn3=findAngularBtnOrange();
+        if(btn3){simClick(btn3);await workerSleep(1000);}
+
+        let code=null;
+        for(let attempt=0;attempt<30;attempt++){
+            await workerSleep(500);
+            code=extractCodeFromPage();
+            if(code)break;
+        }
+
+        if(!code){showToast('Không tìm thấy code!');return;}
+        if(!/^[A-Z0-9]{4,12}$/.test(code)){showToast('Code không hợp lệ: '+code);return;}
+
+        try{GM_setClipboard(code);}
+        catch{try{await navigator.clipboard.writeText(code);}
+        catch{const ta=Object.assign(document.createElement('textarea'),{value:code});ta.style.cssText='position:fixed;opacity:0';document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();}}
+
+        if(window.opener&&!window.opener.closed){
+            try{
+                window.opener.localStorage.setItem(CODE_KEY,code);
+                window.opener.dispatchEvent(new window.opener.StorageEvent('storage',{key:CODE_KEY,newValue:code,storageArea:window.opener.localStorage}));
+            }catch{window.opener.postMessage({type:'OCR_CODE',code},'*');}
+        }else{
+            localStorage.setItem(CODE_KEY,code);
+        }
+
+        showToast(`CODE: ${code}\nĐã copy & gửi về tab gốc.\nĐóng sau 3s...`);
+        await workerSleep(3000);
+        window.close();
+    }
+
+    // ─── ENTRY POINT ──────────────────────────────────────────────────────
+    if(isOnNhapma){
+        if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',createUI);
+        else createUI();
+    } else if(isOpenedByScript){
+        preventThrottling();
+        const runFlow=()=>setTimeout(clickOnTargetSite,3000);
+        if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',runFlow);
+        else runFlow();
+    }
+
+})();
