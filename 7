@@ -1,0 +1,2050 @@
+// ==UserScript==
+// @name         Layma.net AI Auto Code v2.5
+// @namespace    http://tampermonkey.net/
+// @version      2.5
+// @description  layma.net: AI scan image -> Facebook Redirect -> wait page load -> scroll -> find LAY MA btn -> handle challenges -> hCaptcha -> extract code -> autofill.
+// @match        https://link4m.net/*
+// @match        https://l.facebook.com/l.php*
+// @match        https://www.facebook.com/l.php*
+// @match        https://www.facebook.com/flx/warn/*
+// @match        https://l.facebook.com/flx/warn/*
+// @match        *://*/*
+// @grant        GM_setClipboard
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @grant        unsafeWindow
+// @run-at       document-start
+// @connect      openrouter.ai
+// @connect      *
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ─── CONFIG ───────────────────────────────────────────────────────────
+    const API_KEY        = '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';
+    const TARGET_IMG_SEL = 'img#hinh_nv, img.img-fluid.rounded[src*="api.layma.net"]';
+
+    const TAB_NAME      = 'layma_target_v2';
+    const IMG_MAP_KEY   = 'layma_img_map_v2';
+    const COUNTDOWN_KEY = 'layma_countdown_end_v2';
+    const CODE_KEY      = 'layma_pending_code_v2';
+
+    // Key lưu fingerprint nút LẤY MÃ do user import thủ công
+    // Mỗi hostname lưu 1 fingerprint riêng
+    const BTN_IMPORT_KEY = 'layma_btn_import_v2';
+
+    const HARDCODED_FREE_VISION_MODELS = [
+        'meta-llama/llama-3.2-11b-vision-instruct:free',
+        'qwen/qwen2-vl-7b-instruct:free',
+        'google/gemini-flash-1.5:free',
+        'google/gemini-2.0-flash-exp:free',
+        'moondream/moondream2:free',
+        'microsoft/phi-3.5-mini-128k-instruct:free',
+    ];
+
+    // ─── FACEBOOK REDIRECT HANDLER ────────────────────────────────────────
+    const host = location.hostname;
+    const path = location.pathname;
+
+    const isFBRedirect =
+        (host === 'l.facebook.com' || host === 'www.facebook.com') &&
+        (path.includes('/l.php') || path.includes('/flx/warn'));
+
+    if (isFBRedirect) {
+        const handleFBRedirect = () => {
+            function findTruyCapBtn() {
+                const allSpans = document.querySelectorAll('span');
+                for (const sp of allSpans) {
+                    const t = (sp.innerText || sp.textContent || '').trim();
+                    if (t === 'Truy cập vào liên kết' || t.includes('Truy cập vào liên kết')) {
+                        let el = sp;
+                        for (let i = 0; i < 8; i++) {
+                            el = el.parentElement;
+                            if (!el) break;
+                            if (el.getAttribute('role') === 'button' || el.tagName === 'BUTTON' || el.tagName === 'A') return el;
+                            if (el.classList && (el.classList.contains('x1ja2u2z') || el.classList.contains('x1e0frkt'))) return el;
+                        }
+                        return sp.closest('[role="button"]') || sp.closest('[role="none"]') || sp.parentElement || sp;
+                    }
+                }
+                for (const div of document.querySelectorAll('[role="none"], [role="button"]')) {
+                    const t = (div.innerText || div.textContent || '').trim();
+                    if (t.includes('Truy cập vào liên kết') || t.includes('Follow Link') || t.includes('Continue')) return div;
+                }
+                for (const div of document.querySelectorAll('div.x1ja2u2z, div.x1e0frkt')) {
+                    const t = (div.innerText || div.textContent || '').trim();
+                    if (t.includes('Truy cập') || t.includes('liên kết') || t.includes('Follow') || t.includes('Continue')) return div;
+                }
+                for (const a of document.querySelectorAll('a[href]')) {
+                    const href = a.href || '';
+                    const t = (a.innerText || a.textContent || '').trim();
+                    if ((t.includes('Truy cập') || t.includes('Continue') || t.includes('Follow')) && !href.includes('facebook.com')) return a;
+                }
+                return null;
+            }
+            function extractRealURL() {
+                const params = new URLSearchParams(location.search);
+                let real = params.get('u') || params.get('q');
+                if (real) { try { return decodeURIComponent(real); } catch { return real; } }
+                for (const a of document.querySelectorAll('a[href]')) {
+                    const href = a.href || '';
+                    if (href && !href.includes('facebook.com') && href.startsWith('http')) return href;
+                }
+                const metaRefresh = document.querySelector('meta[http-equiv="refresh"]');
+                if (metaRefresh) {
+                    const content = metaRefresh.getAttribute('content') || '';
+                    const m = content.match(/url=(.+)/i);
+                    if (m) return m[1].trim();
+                }
+                return null;
+            }
+            let attempts = 0;
+            const tryClick = () => {
+                attempts++;
+                const btn = findTruyCapBtn();
+                if (btn) {
+                    const rect = btn.getBoundingClientRect();
+                    const cx = rect.left + rect.width / 2;
+                    const cy = rect.top + rect.height / 2;
+                    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(ev => {
+                        try {
+                            const Ctor = ev.startsWith('pointer') ? PointerEvent : MouseEvent;
+                            btn.dispatchEvent(new Ctor(ev, { bubbles:true, cancelable:true, view:window, clientX:cx, clientY:cy }));
+                        } catch(_) {}
+                    });
+                    try { btn.click(); } catch(_) {}
+                    if (btn.tagName === 'A' && btn.href && !btn.href.includes('facebook.com')) {
+                        setTimeout(() => { if (location.hostname === host) location.href = btn.href; }, 1000);
+                    }
+                    setTimeout(() => {
+                        if (location.hostname === host) {
+                            const real = extractRealURL();
+                            if (real) { try { location.replace(real); } catch(e) { location.href = real; } }
+                        }
+                    }, 2500);
+                    return;
+                }
+                if (attempts < 25) setTimeout(tryClick, 300);
+                else {
+                    const real = extractRealURL();
+                    if (real) { try { location.replace(real); } catch(e) { location.href = real; } }
+                }
+            };
+            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => setTimeout(tryClick, 200));
+            else setTimeout(tryClick, 200);
+        };
+        handleFBRedirect();
+        return;
+    }
+
+    const isOnLayma    = host.includes('layma.net');
+    const isForceRunTab = (window.name === TAB_NAME);
+    if (isForceRunTab) _installForceRun(window);
+
+    // ─── FORCE-RUN (anti-throttle) ────────────────────────────────────────
+    function _installForceRun(win) {
+        try {
+            Object.defineProperty(win.document, 'hidden', { get: () => false, configurable: true });
+            Object.defineProperty(win.document, 'visibilityState', { get: () => 'visible', configurable: true });
+            win.document.addEventListener('visibilitychange', e => { e.stopImmediatePropagation(); e.preventDefault(); }, true);
+        } catch(_) {}
+        const _keepRaf = () => win.requestAnimationFrame(_keepRaf);
+        win.requestAnimationFrame(_keepRaf);
+
+        const WORKER_CODE = `var timers={};self.onmessage=function(e){var m=e.data;if(m.cmd==='ST'){var tid=setTimeout(function(){delete timers[m.mid];self.postMessage({mid:m.mid,type:'ST'});},m.delay);timers[m.mid]=tid;}else if(m.cmd==='SI'){var tid=setInterval(function(){self.postMessage({mid:m.mid,type:'SI'});},m.delay);timers[m.mid]=tid;}else if(m.cmd==='CLR'){if(timers[m.mid]){clearTimeout(timers[m.mid]);clearInterval(timers[m.mid]);delete timers[m.mid];}}};`;
+        let _timerWorker = null;
+        try { const blob = new Blob([WORKER_CODE], { type: 'application/javascript' }); _timerWorker = new Worker(URL.createObjectURL(blob)); } catch(_) {}
+        if (_timerWorker) {
+            const _cbMap = new Map(); let _mid = 1;
+            _timerWorker.onmessage = function(e) {
+                const { mid, type } = e.data;
+                const entry = _cbMap.get(mid); if (!entry) return;
+                try { if (typeof entry.fn === 'function') entry.fn(...(entry.args||[])); else { try { eval(entry.fn); } catch(_) {} } } catch(_) {}
+                if (type === 'ST') _cbMap.delete(mid);
+            };
+            const _origST = win.setTimeout.bind(win), _origSI = win.setInterval.bind(win), _origCST = win.clearTimeout.bind(win);
+            win.setTimeout = function(fn, delay, ...args) {
+                delay = +delay || 0;
+                if (delay < 300) return _origST(fn, delay, ...args);
+                const mid = _mid++; _cbMap.set(mid, { fn, args });
+                _timerWorker.postMessage({ cmd:'ST', mid, delay });
+                return -(mid + 900000);
+            };
+            win.setInterval = function(fn, delay, ...args) {
+                delay = +delay || 4;
+                if (delay < 300) return _origSI(fn, delay, ...args);
+                const mid = _mid++; _cbMap.set(mid, { fn, args, repeat:true });
+                _timerWorker.postMessage({ cmd:'SI', mid, delay });
+                return -(mid + 900000);
+            };
+            const _clearShared = id => {
+                if (typeof id === 'number' && id < -900000) {
+                    const mid = -(id+900000); _cbMap.delete(mid); _timerWorker.postMessage({ cmd:'CLR', mid });
+                } else { _origCST(id); }
+            };
+            win.clearTimeout = _clearShared;
+            win.clearInterval = _clearShared;
+        }
+        try {
+            const AC = win.AudioContext || win.webkitAudioContext;
+            if (AC) {
+                const ac = new AC(), buf = ac.createBuffer(1,1,22050), src = ac.createBufferSource(), g = ac.createGain();
+                g.gain.value = 0.00001; src.buffer = buf; src.loop = true;
+                src.connect(g); g.connect(ac.destination); src.start(0);
+                setInterval(() => { if (ac.state === 'suspended') ac.resume(); }, 1000);
+            }
+        } catch(_) {}
+    }
+
+    const isOpenedByScript = isForceRunTab || (() => {
+        try { return !isOnLayma && !!window.opener && !window.opener.closed; } catch(e) { return false; }
+    })();
+
+    if (!isOnLayma && !isOpenedByScript) return;
+
+    // ─── HELPERS ──────────────────────────────────────────────────────────
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    function workerSleep(ms, onTick) {
+        return new Promise(resolve => {
+            let resolved = false;
+            const done = () => { if (!resolved) { resolved = true; resolve(); } };
+            const fallbackId = setTimeout(done, ms + 200);
+            try {
+                const code = `var start=Date.now(),dur=${ms};var iv=setInterval(function(){var el=Date.now()-start,rem=Math.max(0,dur-el);self.postMessage({elapsed:el,remaining:rem});if(el>=dur){clearInterval(iv);self.postMessage({done:true});}},200);`;
+                const w = new Worker(URL.createObjectURL(new Blob([code], { type:'application/javascript' })));
+                w.onmessage = e => {
+                    if (e.data.done) { w.terminate(); clearTimeout(fallbackId); done(); }
+                    else if (onTick) onTick(e.data.remaining);
+                };
+                w.onerror = () => { w.terminate(); };
+            } catch(_) {}
+        });
+    }
+
+    let _ac = null;
+    function preventThrottling() {
+        const tryStart = () => {
+            try {
+                const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+                if (!_ac) {
+                    _ac = new AC();
+                    const buf = _ac.createBuffer(1,1,22050), src = _ac.createBufferSource(), g = _ac.createGain();
+                    g.gain.value = 0.00001; src.buffer = buf; src.loop = true;
+                    src.connect(g); g.connect(_ac.destination); src.start(0);
+                }
+                if (_ac.state === 'suspended') _ac.resume();
+            } catch(_) {}
+        };
+        tryStart();
+        ['click','touchstart','keydown'].forEach(ev => document.addEventListener(ev, tryStart, { passive:true }));
+        setInterval(() => { if (_ac && _ac.state === 'suspended') _ac.resume(); }, 2000);
+    }
+
+    // ─── STORAGE ──────────────────────────────────────────────────────────
+    const getList  = () => { try { return JSON.parse(localStorage.getItem('layma_url_list') || '[]'); } catch { return []; } };
+    const saveList = l => localStorage.setItem('layma_url_list', JSON.stringify(l));
+    function addURL(url) { const l = getList(); if (!l.includes(url)) { l.unshift(url); saveList(l); } }
+
+    function getImgMap()   { try { return JSON.parse(localStorage.getItem(IMG_MAP_KEY) || '{}'); } catch { return {}; } }
+    function saveImgMap(m) { localStorage.setItem(IMG_MAP_KEY, JSON.stringify(m)); }
+    function normKey(src) {
+        if (!src) return '';
+        try { const u = new URL(src); return (u.origin + u.pathname).toLowerCase(); }
+        catch { return src.toLowerCase().replace(/\?.*$/, ''); }
+    }
+    function saveImgURL(imgSrc, url, votes) {
+        if (!imgSrc || !url) return;
+        const m = getImgMap(), k = normKey(imgSrc); if (!k) return;
+        const prev = m[k] || { count:0 };
+        m[k] = { url, votes: votes||1, lastSeen: Date.now(), count: (prev.count||0)+1 };
+        saveImgMap(m);
+    }
+    function lookupImgURL(imgSrc) {
+        if (!imgSrc) return null;
+        const m = getImgMap(), k = normKey(imgSrc);
+        return m[k] ? m[k].url : null;
+    }
+
+    // ─── BTN IMPORT STORAGE ───────────────────────────────────────────────
+    // Lưu fingerprint nút theo hostname, dùng khi script không tự tìm được
+    function getBtnImportMap() { try { return JSON.parse(localStorage.getItem(BTN_IMPORT_KEY) || '{}'); } catch { return {}; } }
+    function saveBtnImportMap(m) { localStorage.setItem(BTN_IMPORT_KEY, JSON.stringify(m)); }
+
+    // Lưu fingerprint nút cho hostname hiện tại
+    function saveBtnFingerprint(hostname, fingerprint) {
+        const m = getBtnImportMap();
+        m[hostname] = { fingerprint, savedAt: Date.now() };
+        saveBtnImportMap(m);
+    }
+
+    // Lấy fingerprint đã lưu cho hostname hiện tại
+    function loadBtnFingerprint(hostname) {
+        const m = getBtnImportMap();
+        return m[hostname] ? m[hostname].fingerprint : null;
+    }
+
+    // ─── BTN FINGERPRINT PARSER ───────────────────────────────────────────
+    // Parse HTML paste từ F12 -> trích xuất fingerprint (inline style của span ngoài + text span trong)
+    function parseBtnHTML(htmlStr) {
+        try {
+            const div = document.createElement('div');
+            div.innerHTML = htmlStr.trim();
+            // Tìm span ngoài: có cursor:pointer, display:inline-block, border-radius, padding
+            const spans = div.querySelectorAll('span');
+            for (const sp of spans) {
+                const style = sp.getAttribute('style') || '';
+                const hasCursor      = style.includes('cursor: pointer') || style.includes('cursor:pointer');
+                const hasInlineBlock = style.includes('display: inline-block') || style.includes('display:inline-block');
+                const hasBorderRadius= style.includes('border-radius');
+                const hasPadding     = style.includes('padding');
+                if (!(hasCursor && hasInlineBlock && hasBorderRadius && hasPadding)) continue;
+
+                // Lấy text từ span con (nếu có) hoặc span chính
+                const innerSpan = sp.querySelector('span');
+                const btnText = (innerSpan ? innerSpan.textContent : sp.textContent || '').trim();
+
+                // Trích xuất background-color từ style inline
+                const bgMatch = style.match(/background(?:-color)?:\s*([^;]+)/i);
+                const bgColor = bgMatch ? bgMatch[1].trim() : '';
+
+                // Trích xuất font-size
+                const fsMatch = style.match(/font-size:\s*([^;]+)/i);
+                const fontSize = fsMatch ? fsMatch[1].trim() : '';
+
+                // Trích xuất font-weight
+                const fwMatch = style.match(/font-weight:\s*([^;]+)/i);
+                const fontWeight = fwMatch ? fwMatch[1].trim() : '';
+
+                // Trích xuất border-radius
+                const brMatch = style.match(/border-radius:\s*([^;]+)/i);
+                const borderRadius = brMatch ? brMatch[1].trim() : '';
+
+                // Trích xuất inner span style (nếu có)
+                const innerStyle = innerSpan ? (innerSpan.getAttribute('style') || '') : '';
+
+                return {
+                    outerStyle: style,          // toàn bộ style của span ngoài
+                    innerStyle,                 // style của span trong
+                    btnText,                    // text của nút
+                    bgColor,                    // màu nền
+                    fontSize,                   // font-size
+                    fontWeight,                 // font-weight
+                    borderRadius,               // border-radius
+                    hasInnerSpan: !!innerSpan,  // có span lồng không
+                };
+            }
+            return null;
+        } catch(e) {
+            console.error('[LAYMA] parseBtnHTML error:', e);
+            return null;
+        }
+    }
+
+    // ─── BTN FINDER BẰNG FINGERPRINT ─────────────────────────────────────
+    // Tìm nút theo fingerprint đã lưu từ import thủ công
+    function findBtnByFingerprint(fingerprint) {
+        if (!fingerprint) return null;
+        const allSpans = document.querySelectorAll('span');
+        for (const sp of allSpans) {
+            const style = sp.getAttribute('style') || '';
+
+            // So khớp các thuộc tính key từ fingerprint
+            if (fingerprint.bgColor) {
+                // Normalize để so sánh (bỏ spaces thừa)
+                const normBg = (color) => color.replace(/\s+/g,'').toLowerCase();
+                // Lấy màu thực tế từ style attribute và computed style
+                const styleBg = style.match(/background(?:-color)?:\s*([^;]+)/i);
+                const attrBg = styleBg ? normBg(styleBg[1]) : '';
+                const compBg = normBg(window.getComputedStyle(sp).backgroundColor || '');
+                const fpBg   = normBg(fingerprint.bgColor);
+                if (attrBg !== fpBg && !compBg.includes(fpBg.replace('rgb(','').replace(')','').trim())) {
+                    // Thử so sánh loosely (rgb values)
+                    const extractRGB = s => s.match(/\d+/g) || [];
+                    const fpRGB   = extractRGB(fpBg).join(',');
+                    const attrRGB = extractRGB(attrBg).join(',');
+                    const compRGB = extractRGB(compBg).join(',');
+                    if (fpRGB && attrRGB !== fpRGB && compRGB !== fpRGB) continue;
+                }
+            }
+            if (fingerprint.fontSize && !style.includes(fingerprint.fontSize)) continue;
+            if (fingerprint.fontWeight && !style.includes(fingerprint.fontWeight)) continue;
+            if (fingerprint.borderRadius && !style.includes(fingerprint.borderRadius)) continue;
+
+            // Kiểm tra text
+            const innerSpan = sp.querySelector('span');
+            const actualText = (innerSpan ? innerSpan.textContent : sp.textContent || '').trim();
+            if (fingerprint.btnText && actualText !== fingerprint.btnText) continue;
+
+            console.log('[LAYMA v2.5] Found btn by saved fingerprint:', actualText);
+            return sp;
+        }
+        return null;
+    }
+
+    // ─── EXPORT / IMPORT ──────────────────────────────────────────────────
+    function exportData() {
+        const payload = { version:'layma-v2.5', exported_at: new Date().toISOString(), url_list: getList(), img_map: getImgMap(), btn_import: getBtnImportMap() };
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type:'application/json' }));
+        a.download = 'layma_backup_' + Date.now() + '.json';
+        a.click(); URL.revokeObjectURL(a.href);
+    }
+    function importData(file, onDone) {
+        const r = new FileReader();
+        r.onload = e => {
+            try {
+                const data = JSON.parse(e.target.result);
+                let au = 0, ai = 0, ab = 0;
+                if (Array.isArray(data.url_list)) {
+                    const cur = getList();
+                    const merged = [...new Set([...data.url_list, ...cur])];
+                    saveList(merged);
+                    au = data.url_list.filter(u => !cur.includes(u)).length;
+                }
+                const imgKey = data.img_map || data.ocr_img_map;
+                if (imgKey && typeof imgKey === 'object') {
+                    const cur = getImgMap();
+                    for (const [k, v] of Object.entries(imgKey)) {
+                        if (!cur[k] || (v.lastSeen||0) > (cur[k].lastSeen||0)) { cur[k] = v; ai++; }
+                    }
+                    saveImgMap(cur);
+                }
+                if (data.btn_import && typeof data.btn_import === 'object') {
+                    const cur = getBtnImportMap();
+                    for (const [k, v] of Object.entries(data.btn_import)) {
+                        if (!cur[k] || (v.savedAt||0) > (cur[k].savedAt||0)) { cur[k] = v; ab++; }
+                    }
+                    saveBtnImportMap(cur);
+                }
+                onDone('+' + au + ' URL, +' + ai + ' imgs, +' + ab + ' btns', 'ok');
+            } catch(err) { onDone('File error: ' + err.message, 'err'); }
+        };
+        r.readAsText(file);
+    }
+
+    // ─── TLD / URL UTILS ──────────────────────────────────────────────────
+    const TLD_LIST = ['com','net','org','io','vn','co','app','link','site','me','tv','gg','bet','win','club','live','online','xyz','info','pro','cc','us','uk','id','sg','ph','th','my','top','fun','store','shop','game','nl','de','fr','jp','ru','au','ca','br','in','es','it','pl','se','no','dk','fi','be','at','ch','gr','pt','tr','mx','ar','cl','pe','nz','biz','mobi','asia','si','ro'];
+    const TLD_PAT  = TLD_LIST.join('|');
+
+    function cleanURL(u) {
+        if (!u) return '';
+        u = u.trim().replace(/[.,;:!?)>"''«»\]`]+$/g,'').trim();
+        if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+        return u.replace(/\.{2,}/g,'.').replace(/\/+$/,'');
+    }
+    function isValidURL(u) {
+        if (!u || u.length < 10) return false;
+        if (!/^https?:\/\//i.test(u)) return false;
+        if (!/https?:\/\/[a-zA-Z0-9\-]{2,}\.[a-zA-Z]{2,}/i.test(u)) return false;
+        if (/\.\.\.|localhost|127\.|192\.168\./.test(u)) return false;
+        const domain = u.replace(/^https?:\/\//i,'').split('/')[0];
+        const parts  = domain.split('.');
+        if (parts.length < 2 || parts[0].length < 2) return false;
+        if (/[^a-zA-Z0-9\-\.]/.test(domain)) return false;
+        return TLD_LIST.includes(parts[parts.length-1].toLowerCase());
+    }
+    function scanPageMetaURLs() {
+        const found = new Set();
+        const add = u => { const c = cleanURL(u); if (isValidURL(c) && !c.includes('layma.net') && !c.includes('facebook.com')) found.add(c); };
+        const canonical = document.querySelector('link[rel="canonical"]'); if (canonical?.href) add(canonical.href);
+        const ogUrl = document.querySelector('meta[property="og:url"]'); if (ogUrl?.content) add(ogUrl.content);
+        const twUrl = document.querySelector('meta[name="twitter:url"]'); if (twUrl?.content) add(twUrl.content);
+        return [...found];
+    }
+    function quickScanDOMForURL() {
+        const found = new Set();
+        for (const u of scanPageMetaURLs()) found.add(u);
+        const TLD_RE = new RegExp(`https?:\\/\\/[^\\s<>"']{4,}|www\\.[a-zA-Z0-9\\-]{2,60}\\.(?:${TLD_PAT})(?:\\/[^\\s<>"']*)?`, 'gi');
+        for (const el of document.querySelectorAll('cite,a,span,div,p,small,[class*="url"],[class*="link"]')) {
+            if (el.offsetParent === null) continue;
+            const t = (el.innerText || el.textContent || '').trim();
+            if (t.length < 4 || t.length > 300) continue;
+            for (const m of t.matchAll(TLD_RE)) {
+                const u = cleanURL(m[0].startsWith('http') ? m[0] : 'https://'+m[0]);
+                if (isValidURL(u)) found.add(u);
+            }
+        }
+        for (const a of document.querySelectorAll('a[href]')) {
+            const href = a.href || '';
+            if (isValidURL(href) && !href.includes('layma.net') && !href.includes('facebook.com')) found.add(href);
+        }
+        return [...found];
+    }
+    function fuzzyMatch(rawUrl) {
+        if (!rawUrl) return { url:rawUrl, matched:false, score:0 };
+        const list = getList(); if (!list.length) return { url:rawUrl, matched:false, score:0 };
+        const norm = u => u.toLowerCase().replace(/^https?:\/\/(www\.)?/,'').replace(/\/+$/,'');
+        const nr = norm(rawUrl);
+        for (const s of list) if (norm(s) === nr) return { url:s, matched:true, score:1 };
+        let best = null, bScore = 0;
+        for (const s of list) {
+            const ns = norm(s);
+            if (ns.includes(nr) || nr.includes(ns)) {
+                const sc = Math.min(nr.length, ns.length) / Math.max(nr.length, ns.length);
+                if (sc >= 0.65 && sc > bScore) { bScore = sc; best = s; }
+            }
+        }
+        if (best) return { url:best, matched:true, score:bScore };
+        return { url:rawUrl, matched:false, score:0 };
+    }
+    function showCandidates(urls, boxId) {
+        const cb = document.getElementById(boxId || 'layma-cand-v2');
+        if (!cb) return;
+        if (!urls || urls.length <= 1) { cb.style.display = 'none'; return; }
+        cb.style.display = 'block'; cb.innerHTML = '';
+        urls.slice(0,6).forEach(u => {
+            const d = document.createElement('div');
+            d.className = 'layma-cand-item'; d.title = u; d.textContent = u;
+            d.onclick = () => { const inp = document.getElementById('layma-url-box-v2'); if (inp) inp.value = u; };
+            cb.appendChild(d);
+        });
+    }
+    function extractURLFromAIText(rawText) {
+        if (!rawText) return '';
+        const text = rawText.trim();
+        const fullUrlRe = /https?:\/\/[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/gi;
+        const fullMatches = text.match(fullUrlRe);
+        if (fullMatches) { for (const m of fullMatches) { const c = cleanURL(m); if (isValidURL(c)) return c; } }
+        const wwwRe = new RegExp(`www\\.([a-zA-Z0-9\\-]{2,60}\\.(?:${TLD_PAT})(?:\\/[^\\s]*)?)`, 'gi');
+        const wwwMatches = text.match(wwwRe);
+        if (wwwMatches) { const c = cleanURL(wwwMatches[0]); if (isValidURL(c)) return c; }
+        const domainRe = new RegExp(`\\b([a-zA-Z0-9][a-zA-Z0-9\\-]{1,59}\\.(?:${TLD_PAT}))(?:[/\\s"'\`]|$)`, 'gi');
+        let dm; const domCandidates = [];
+        while ((dm = domainRe.exec(text)) !== null) { const c = cleanURL(dm[1]); if (isValidURL(c)) domCandidates.push(c); }
+        if (domCandidates.length) { domCandidates.sort((a,b) => b.length-a.length); return domCandidates[0]; }
+        if (text.length < 80 && !text.includes(' ') && text.includes('.')) {
+            const c = cleanURL(text.replace(/^["'`]|["'`]$/g,'')); if (isValidURL(c)) return c;
+        }
+        for (const w of text.split(/[\s\n,;"'`()\[\]]+/)) {
+            if (w.includes('.') && w.length > 4) { const c = cleanURL(w); if (isValidURL(c)) return c; }
+        }
+        return text;
+    }
+
+    // ─── FACEBOOK REDIRECT OPEN ───────────────────────────────────────────
+    function openViaFacebook(url) {
+        const fbUrl = 'https://l.facebook.com/l.php?u=' + encodeURIComponent(url) + '&h=AT3fake';
+        window.open(fbUrl, TAB_NAME);
+    }
+
+    // ─── TARGET IMAGE FINDER ──────────────────────────────────────────────
+    function findTargetImage() {
+        const byId = document.querySelector('img#hinh_nv');
+        if (byId && byId.src && byId.src.startsWith('http')) return byId;
+        for (const img of document.querySelectorAll(TARGET_IMG_SEL)) {
+            if (img.src && img.src.startsWith('http') && img.naturalWidth !== 1) return img;
+        }
+        let best = null, bestArea = 0;
+        for (const img of document.images) {
+            if (!img.src || !img.src.startsWith('http') || img.offsetParent === null) continue;
+            const area = (img.naturalWidth||img.width) * (img.naturalHeight||img.height);
+            if (area > bestArea) { bestArea = area; best = img; }
+        }
+        return best;
+    }
+    function fetchBase64(url) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method:'GET', url, responseType:'blob', timeout:25000,
+                onload: res => {
+                    if (res.status < 200 || res.status >= 300) { reject(new Error('HTTP ' + res.status)); return; }
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve({ base64: reader.result.split(',')[1], mime: (res.response.type||'image/jpeg').split(';')[0] });
+                    reader.onerror = () => reject(new Error('FileReader error'));
+                    reader.readAsDataURL(res.response);
+                },
+                onerror: () => reject(new Error('Cannot load image')),
+                ontimeout: () => reject(new Error('Timeout loading image'))
+            });
+        });
+    }
+
+    // ─── AI VISION MODELS ─────────────────────────────────────────────────
+    async function getVisionModels(setStatus) {
+        let dynamicModels = [];
+        try {
+            setStatus('Fetch model list...','#9b59b6');
+            dynamicModels = await new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method:'GET', url:'https://openrouter.ai/api/v1/models',
+                    headers:{ 'Authorization':`Bearer ${API_KEY}`, 'Content-Type':'application/json' },
+                    timeout:10000,
+                    onload: res => {
+                        try {
+                            const all = JSON.parse(res.responseText).data || [];
+                            resolve(all.filter(m => {
+                                const isFree = m.id.endsWith(':free') ||
+                                    (m.pricing && (m.pricing.prompt==='0'||m.pricing.prompt===0) && (m.pricing.completion==='0'||m.pricing.completion===0));
+                                const notClip = !/clip|embed|text-to-image|t2i|diffusion|stable-diffusion|dall-e|lyria|music|audio/i.test(m.id);
+                                const inputMods = m.architecture?.input_modalities || [];
+                                const hasVisionName = /vision|vl|flash|pixtral|qwen.*vl|llama.*vision|phi.*vision|phi.*multimodal|kimi-vl|ui-tars|moondream|bakllava|llava|minicpm.*v|internvl|gemini/i.test(m.id);
+                                return isFree && notClip && (inputMods.includes('image') || hasVisionName);
+                            }).map(m => m.id));
+                        } catch(e) { reject(e); }
+                    },
+                    onerror:  () => reject(new Error('Network error')),
+                    ontimeout:() => reject(new Error('Timeout'))
+                });
+            });
+        } catch(err) { console.warn('[LAYMA] Model list error:', err.message); }
+        const seen = new Set(HARDCODED_FREE_VISION_MODELS);
+        const extra = dynamicModels.filter(m => !seen.has(m));
+        const merged = [...HARDCODED_FREE_VISION_MODELS, ...extra];
+        setStatus(`${merged.length} models ready`, '#9b59b6');
+        return merged;
+    }
+    function callAIModel(base64, mime, model) {
+        const PROMPT = `Look at this image carefully. Find any website URL, domain name, or web address shown in the image.
+Output ONLY the domain or URL with no explanation, no punctuation, no quotes.
+Examples of good output: hitclub.si | www.abc88.com | https://xyz.net
+If no URL found, output: NONE`;
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method:'POST', url:'https://openrouter.ai/api/v1/chat/completions',
+                headers:{
+                    'Content-Type':'application/json',
+                    'Authorization':`Bearer ${API_KEY}`,
+                    'HTTP-Referer':'https://tampermonkey.net',
+                    'X-Title':'Layma AI Scanner v2.5'
+                },
+                data: JSON.stringify({
+                    model,
+                    messages:[{ role:'user', content:[
+                        { type:'image_url', image_url:{ url:`data:${mime};base64,${base64}`, detail:'high' } },
+                        { type:'text', text:PROMPT }
+                    ]}],
+                    max_tokens:120, temperature:0, top_p:1
+                }),
+                timeout:45000,
+                onload: res => {
+                    let data;
+                    try { data = JSON.parse(res.responseText); } catch(e) { reject(new Error('JSON parse error')); return; }
+                    if (data.error) {
+                        const msg = typeof data.error==='object' ? (data.error.message||JSON.stringify(data.error)) : String(data.error);
+                        reject(new Error((msg.includes('rate')||msg.includes('429')||msg.includes('quota') ? 'RATE_LIMIT: ':'') + msg));
+                        return;
+                    }
+                    if (res.status < 200 || res.status >= 300) { reject(new Error('HTTP ' + res.status)); return; }
+                    const text = data?.choices?.[0]?.message?.content?.trim();
+                    if (!text || text.toUpperCase() === 'NONE' || text.length < 2) { reject(new Error('Empty/NONE response')); return; }
+                    const extracted = extractURLFromAIText(text);
+                    if (!extracted || extracted.length < 4) { reject(new Error('Cannot extract URL from: ' + text.substring(0,60))); return; }
+                    resolve({ text:extracted, rawText:text, usedModel:data?.model||model });
+                },
+                onerror:  () => reject(new Error('Connection lost')),
+                ontimeout:() => reject(new Error('Timeout 45s'))
+            });
+        });
+    }
+    async function tryAIModels(base64, mime, models, setStatus) {
+        const errors = [];
+        for (let i = 0; i < models.length; i++) {
+            const model = models[i];
+            const shortName = model.split('/').pop().replace(':free','');
+            setStatus(`[${i+1}/${models.length}] ${shortName}`, '#3498db');
+            try {
+                const result = await callAIModel(base64, mime, model);
+                if (result.text && result.text.length > 3 && !result.text.includes('NONE')) return result;
+                errors.push(`${shortName}: bad result "${result.text}"`);
+            } catch(err) {
+                const errMsg = err.message || String(err);
+                errors.push(`${shortName}: ${errMsg}`);
+                if (i < models.length-1) {
+                    setStatus(`Skip ${shortName} -> next...`, '#f39c12');
+                    await sleep(errMsg.includes('RATE_LIMIT') ? 200 : 300);
+                }
+            }
+        }
+        throw new Error(`Tried ${models.length} models. Last: ${errors.slice(-3).join(' | ')}`);
+    }
+
+    // ─── MAIN AI SCAN ─────────────────────────────────────────────────────
+    async function runAIScan(setStatus, urlBox) {
+        if (window._laymaUI) { window._laymaUI.lastScannedImgKey = null; window._laymaUI.lastScannedImgSrc = null; }
+        const metaURLs = scanPageMetaURLs();
+        if (metaURLs.length) {
+            urlBox.value = metaURLs[0];
+            setStatus('Meta URL: ' + metaURLs[0], 'ok');
+            openViaFacebook(metaURLs[0]);
+            showCandidates(metaURLs); return;
+        }
+        const domURLs = quickScanDOMForURL().filter(u => !u.includes('layma.net') && !u.includes('facebook.com'));
+        if (domURLs.length) {
+            const m = fuzzyMatch(domURLs[0]);
+            urlBox.value = m.url || domURLs[0];
+            setStatus('DOM: ' + domURLs.length + ' URL found', 'ok');
+            openViaFacebook(m.url || domURLs[0]);
+            showCandidates(domURLs); return;
+        }
+        for (const img of document.images) {
+            const cached = lookupImgURL(img.src);
+            if (cached) {
+                const m = fuzzyMatch(cached);
+                urlBox.value = m.url || cached;
+                if (window._laymaUI) {
+                    window._laymaUI.selectedImgKey    = normKey(img.src);
+                    window._laymaUI.lastScannedImgKey = normKey(img.src);
+                    window._laymaUI.lastScannedImgSrc = img.src;
+                }
+                setStatus('Cache hit!', 'ok');
+                openViaFacebook(m.url || cached); return;
+            }
+        }
+        setStatus('Finding target image...', '#f1c40f');
+        await sleep(800);
+        const img = findTargetImage();
+        if (!img) { setStatus('No target image found!', 'err'); return; }
+        const imgSrc = img.src;
+        if (window._laymaUI) { window._laymaUI.lastScannedImgSrc = imgSrc; window._laymaUI.lastScannedImgKey = normKey(imgSrc); }
+        setStatus('Downloading image...', '#f1c40f');
+        let imgData;
+        try { imgData = await fetchBase64(imgSrc); setStatus('Image OK (' + imgData.mime + ')', '#f1c40f'); }
+        catch(err) { setStatus('Image load error: ' + err.message, 'err'); return; }
+        let models;
+        try { models = await getVisionModels(setStatus); await sleep(200); }
+        catch(err) { models = [...HARDCODED_FREE_VISION_MODELS]; setStatus('Using ' + models.length + ' hardcoded models', '#f39c12'); }
+        try {
+            const { text, usedModel } = await tryAIModels(imgData.base64, imgData.mime, models, setStatus);
+            const isValid = isValidURL(text.startsWith('http') ? text : 'https://'+text);
+            let finalURL = isValid ? cleanURL(text) : text;
+            const matched = fuzzyMatch(finalURL);
+            if (matched.matched) finalURL = matched.url;
+            urlBox.value = finalURL;
+            if (imgSrc) { saveImgURL(imgSrc, finalURL, 1); if (window._laymaUI) window._laymaUI.selectedImgKey = normKey(imgSrc); }
+            const modelShort = usedModel.split('/').pop().replace(':free','');
+            const matchInfo  = matched.matched ? ('Matched '+Math.round(matched.score*100)+'%') : ('Model: '+modelShort);
+            setStatus((isValid ? 'OK ' : 'WARN ') + matchInfo + ' -> ' + finalURL, 'ok');
+            openViaFacebook(finalURL);
+        } catch(err) { setStatus('AI Error: ' + err.message, 'err'); }
+    }
+
+    // ─── COUNTDOWN WATCHER (layma.net side) ───────────────────────────────
+    function startCountdownWatcher() {
+        let overlayEl = null;
+        const getOrCreate = () => {
+            if (overlayEl && document.body.contains(overlayEl)) return overlayEl;
+            overlayEl = document.createElement('div');
+            overlayEl.id = 'layma-countdown-v2';
+            overlayEl.style.cssText = 'position:fixed;bottom:16px;right:16px;background:linear-gradient(135deg,#0d1a0d,#0f2211);border:1px solid rgba(11,244,5,.4);border-radius:12px;padding:10px 20px;font-family:"Orbitron",monospace;font-size:24px;font-weight:900;color:#0bf405;z-index:9999998;box-shadow:0 0 30px rgba(11,244,5,.25);text-align:center;min-width:100px;display:none;text-shadow:0 0 15px rgba(11,244,5,.8);letter-spacing:2px;';
+            document.body.appendChild(overlayEl);
+            return overlayEl;
+        };
+        const tick = () => {
+            const endStr = localStorage.getItem(COUNTDOWN_KEY);
+            const ov = getOrCreate();
+            if (!endStr) { ov.style.display = 'none'; setTimeout(tick, 500); return; }
+            const remaining = Math.ceil((parseInt(endStr) - Date.now()) / 1000);
+            if (remaining <= 0) { localStorage.removeItem(COUNTDOWN_KEY); ov.style.display = 'none'; setTimeout(tick, 500); return; }
+            ov.style.display = 'block'; ov.textContent = remaining + 's';
+            setTimeout(tick, 300);
+        };
+        tick();
+    }
+
+    // ─── CAPTCHA WATCHER ──────────────────────────────────────────────────
+    function startLaymaCaptchaWatcher(setStatus, autoBar) {
+        let watching = false, solved = false, solvedTimer = null;
+        const log = (msg, type) => { if (setStatus) setStatus(msg, type||'ok'); if (autoBar) autoBar.textContent = msg; };
+        function isSolved() {
+            for (const s of ['textarea[id^="h-captcha-response"]','textarea[name="h-captcha-response"]']) {
+                const el = document.querySelector(s); if (el && el.value && el.value.length > 10) return true;
+            }
+            for (const s of ['textarea[id^="g-recaptcha-response"]','textarea[name="g-recaptcha-response"]']) {
+                const el = document.querySelector(s); if (el && el.value && el.value.length > 10) return true;
+            }
+            const anchor = document.querySelector('#recaptcha-anchor');
+            if (anchor && anchor.getAttribute('aria-checked') === 'true') return true;
+            return false;
+        }
+        async function onSolved() {
+            if (solved) return; solved = true;
+            log('Captcha solved! Clicking Xac Nhan...');
+            await sleep(800);
+            const btn = document.querySelector('#btn-xac-nhan') ||
+                [...document.querySelectorAll('button')].find(b =>
+                    (b.textContent||'').trim().toLowerCase().includes('xác nhận') ||
+                    (b.textContent||'').trim().toLowerCase().includes('xac nhan'));
+            if (btn && !btn.disabled) { simClick(btn); log('Clicked Xac Nhan!', 'ok'); }
+            else log('btn-xac-nhan not found', 'err');
+            if (autoBar) setTimeout(() => { autoBar.style.display = 'none'; }, 4000);
+        }
+        const obs = new MutationObserver(() => {
+            const hasCaptcha = !!document.querySelector('iframe[src*="recaptcha"],iframe[src*="hcaptcha"],.g-recaptcha,.h-captcha');
+            if (hasCaptcha && !watching) {
+                watching = true; solved = false; log('Waiting for captcha solve...');
+                const iv = setInterval(() => {
+                    if (isSolved()) {
+                        clearInterval(iv); watching = false;
+                        if (solvedTimer) clearTimeout(solvedTimer);
+                        solvedTimer = setTimeout(() => onSolved(), 500);
+                    }
+                }, 400);
+                setTimeout(() => { clearInterval(iv); watching = false; }, 300000);
+            }
+        });
+        if (document.body) obs.observe(document.body, { childList:true, subtree:true, attributes:true });
+        else document.addEventListener('DOMContentLoaded', () => obs.observe(document.body, { childList:true, subtree:true, attributes:true }));
+    }
+
+    // ─── CODE LISTENER ────────────────────────────────────────────────────
+    function startCodeListener(setStatus, autoBar) {
+        localStorage.removeItem(CODE_KEY);
+        window.addEventListener('storage', async e => {
+            if (e.key !== CODE_KEY || !e.newValue) return;
+            const code = e.newValue; localStorage.removeItem(CODE_KEY);
+            if (autoBar) { autoBar.style.display = 'block'; autoBar.textContent = 'Code: ' + code; }
+            if (setStatus) setStatus('Code received: ' + code, 'ok');
+            await autoFillLaymaCode(code, setStatus, autoBar);
+        });
+        window.addEventListener('message', e => {
+            if (!e.data || e.data.type !== 'LAYMA_CODE' || !e.data.code) return;
+            localStorage.setItem(CODE_KEY, e.data.code);
+            window.dispatchEvent(new StorageEvent('storage', { key:CODE_KEY, newValue:e.data.code, storageArea:localStorage }));
+        });
+    }
+    async function autoFillLaymaCode(code, setStatus, autoBar) {
+        const log = (msg, type) => { if (setStatus) setStatus(msg, type||'ok'); if (autoBar) autoBar.textContent = msg; };
+        log('Filling code: ' + code);
+        const inp = findCodeInput();
+        if (!inp) { log('Input field not found', 'err'); return; }
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(inp, code);
+        ['input','change','keyup'].forEach(ev => inp.dispatchEvent(new Event(ev, { bubbles:true })));
+        inp.focus(); log('Code filled: ' + code);
+        await sleep(1000);
+        const hasCaptcha = !!document.querySelector('iframe[src*="recaptcha"],iframe[src*="hcaptcha"],.g-recaptcha,.h-captcha');
+        if (!hasCaptcha) {
+            const btn = document.querySelector('#btn-xac-nhan') || findConfirmBtn();
+            if (btn) { simClick(btn); log('Clicked Xac Nhan!', 'ok'); }
+            else log('Confirm button not found', 'err');
+        } else { log('Code filled, waiting for captcha solve...'); }
+    }
+
+    // ─── SHARED DOM UTILS ─────────────────────────────────────────────────
+    function findCodeInput() {
+        const byId = document.querySelector('#codeInput');
+        if (byId && byId.offsetParent !== null) return byId;
+        const byName = document.querySelector('input[name="code"]');
+        if (byName && byName.offsetParent !== null) return byName;
+        const cands = [...document.querySelectorAll('input[type="text"],input:not([type])')];
+        for (const i of cands) {
+            if (i.id === 'layma-url-box-v2') continue;
+            if (i.offsetParent === null) continue;
+            const ph = (i.placeholder||'').toLowerCase();
+            if (ph.includes('mã')||ph.includes('ma')||ph.includes('code')||ph.includes('nhập')) return i;
+        }
+        for (const i of cands) {
+            if (i.id === 'layma-url-box-v2') continue;
+            if (i.offsetParent === null) continue;
+            return i;
+        }
+        return null;
+    }
+    function findConfirmBtn() {
+        const all = [...document.querySelectorAll('button')].filter(b => b.offsetParent!==null && !b.disabled);
+        const confirm = all.find(b => {
+            const t = (b.innerText||b.textContent||'').toLowerCase().trim();
+            return t.includes('xác nhận')||t.includes('xac nhan')||t.includes('confirm')||t.includes('submit');
+        });
+        if (confirm) return confirm;
+        return all.find(b => b.type==='submit') || null;
+    }
+
+    function simClick(el) {
+        if (!el) return;
+        try { el.scrollIntoView({ behavior:'smooth', block:'nearest' }); } catch(_) {}
+        el.focus && el.focus();
+        const rect = el.getBoundingClientRect();
+        const cx = rect.left + rect.width/2 || 100;
+        const cy = rect.top  + rect.height/2 || 100;
+        ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(ev => {
+            try {
+                const Ctor = ev.startsWith('pointer') ? PointerEvent : MouseEvent;
+                el.dispatchEvent(new Ctor(ev, { bubbles:true, cancelable:true, view:window, clientX:cx, clientY:cy }));
+            } catch(_) {}
+        });
+        try {
+            const container = el.closest('#R2MO5wyug');
+            if (container) container.dispatchEvent(new MouseEvent('click', { bubbles:true, cancelable:true, view:window, clientX:cx, clientY:cy }));
+        } catch(_) {}
+        try { el.click(); } catch(_) {}
+    }
+
+    function isElementVisible(el) {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display==='none'||style.visibility==='hidden'||style.opacity==='0') return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width===0 && rect.height===0) return false;
+        let parent = el.parentElement;
+        while (parent && parent !== document.body) {
+            const ps = window.getComputedStyle(parent);
+            if (ps.display==='none') return false;
+            parent = parent.parentElement;
+        }
+        return true;
+    }
+
+    // ─── WAIT FOR PAGE FULLY LOADED ───────────────────────────────────────
+    function waitForPageLoad() {
+        return new Promise(resolve => {
+            if (document.readyState === 'complete') { resolve(); return; }
+            window.addEventListener('load', resolve, { once:true });
+            setTimeout(resolve, 8000);
+        });
+    }
+
+    // ─── SCROLL TO BOTTOM ─────────────────────────────────────────────────
+    async function scrollToBottom() {
+        return new Promise(resolve => {
+            const scrollHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, document.body.offsetHeight);
+            window.scrollTo({ top:scrollHeight, behavior:'smooth' });
+            for (let i = 0; i < 5; i++) {
+                setTimeout(() => {
+                    window.dispatchEvent(new Event('scroll', { bubbles:true }));
+                    document.dispatchEvent(new Event('scroll', { bubbles:true }));
+                    try { window.dispatchEvent(new WheelEvent('wheel', { deltaY:800, bubbles:true })); } catch(_) {}
+                }, i*150);
+            }
+            setTimeout(resolve, 1200);
+        });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  ★★★  FIND LAY MA BUTTON  ★★★
+    //
+    //  Ưu tiên theo thứ tự:
+    //   1. Fingerprint đã import thủ công (qua mini-menu ở trang đích)
+    //   2. Nhận dạng bằng inline-style fingerprint (span lồng nhau)
+    //   3. #R2MO5wyug fallback
+    //
+    //  Cách nhận dạng inline-style (phương pháp 2):
+    //   - Span NGOÀI phải có ĐỦ 6 thuộc tính trong style attribute:
+    //       border-radius, padding, cursor:pointer, display:inline-block,
+    //       font-weight:700, line-height
+    //   - Span TRONG phải có:
+    //       display:inline-block, vertical-align:middle, color:#fff
+    //   - Text của span trong phải là "LẤY MÃ"
+    //
+    //  Nếu cần sửa (web đích thay đổi):
+    //   → Mở mini-menu (hình tròn xanh góc dưới phải) → Import HTML
+    //   → Paste HTML của nút từ F12 vào → Save
+    //   → Script sẽ ưu tiên dùng fingerprint đó từ lần sau
+    // ══════════════════════════════════════════════════════════════════════
+    function findLayMaBtn() {
+        const currentHost = location.hostname;
+
+        // ── Phương pháp 1: Dùng fingerprint đã import thủ công ──────────
+        // (xem mini-menu bên dưới để biết cách import)
+        const savedFP = loadBtnFingerprint(currentHost);
+        if (savedFP) {
+            const byFP = findBtnByFingerprint(savedFP);
+            if (byFP) {
+                console.log('[LAYMA v2.5] Using SAVED fingerprint for', currentHost);
+                return byFP;
+            }
+            console.warn('[LAYMA v2.5] Saved fingerprint not matched, falling back...');
+        }
+
+        // ── Phương pháp 2: Nhận dạng bằng inline-style fingerprint ──────
+        // Nút LẤY MÃ gốc có cấu trúc:
+        //   <span style="background:rgb(11,244,5); border:1px solid #fff;
+        //     color:#fff; font-weight:700; font-size:14px; border-radius:7px;
+        //     padding:5px 10px; min-height:auto; line-height:20px;
+        //     vertical-align:middle; width:auto; cursor:pointer; display:inline-block">
+        //     <span style="display:inline-block;vertical-align:middle;color:#fff">LẤY MÃ</span>
+        //   </span>
+        const allSpans = document.querySelectorAll('span');
+        for (const sp of allSpans) {
+            const style = sp.getAttribute('style') || '';
+
+            // Kiểm tra 6 thuộc tính bắt buộc trên span NGOÀI
+            // (thay đổi list này nếu trang đích cập nhật style)
+            const hasBorderRadius = style.includes('border-radius');
+            const hasPadding      = style.includes('padding');
+            const hasCursor       = style.includes('cursor: pointer') || style.includes('cursor:pointer');
+            const hasInlineBlock  = style.includes('display: inline-block') || style.includes('display:inline-block');
+            const hasFontWeight   = style.includes('font-weight: 700') || style.includes('font-weight:700');
+            const hasLineHeight   = style.includes('line-height');
+
+            // Cần đủ cả 6 điều kiện để tránh nhầm với nút khác
+            if (!(hasBorderRadius && hasPadding && hasCursor && hasInlineBlock && hasFontWeight && hasLineHeight)) continue;
+
+            // Kiểm tra span CON: phải có display:inline-block + vertical-align:middle + color:#fff
+            const innerSpan = sp.querySelector('span');
+            if (!innerSpan) continue;
+            const innerStyle = innerSpan.getAttribute('style') || '';
+            const innerOk = (innerStyle.includes('inline-block') || innerStyle.includes('inline')) &&
+                            (innerStyle.includes('color:#fff') || innerStyle.includes('color: #fff'));
+            if (!innerOk) continue;
+
+            // Text phải là "LẤY MÃ" (chính xác, tránh "LẤY MÃ SAU XX")
+            const innerText = (innerSpan.textContent || '').trim();
+            if (innerText !== 'LẤY MÃ') continue;
+
+            // Bỏ qua nếu đang disabled/countdown (text span ngoài có "SAU")
+            const outerText = (sp.textContent || '').trim();
+            if (/SAU\s*\d/i.test(outerText)) continue;
+
+            console.log('[LAYMA v2.5] Found by inline-style fingerprint, bg:', window.getComputedStyle(sp).backgroundColor);
+            return sp;
+        }
+
+        // ── Phương pháp 3: #R2MO5wyug container fallback ────────────────
+        const container = document.querySelector('#R2MO5wyug');
+        if (container) {
+            console.log('[LAYMA v2.5] Fallback: using #R2MO5wyug container');
+            return container;
+        }
+
+        console.warn('[LAYMA v2.5] LAY MA button NOT FOUND by any method');
+        return null;
+    }
+
+    // Kiểm tra nút đã active (màu xanh) hay chưa
+    function isLayMaBtnActive(btn) {
+        if (!btn) return false;
+        const bg = window.getComputedStyle(btn).backgroundColor;
+        return bg.includes('11, 244, 5') || bg.includes('11,244,5') ||
+               bg.includes('0, 255, 0')  || bg.includes('0,255,0');
+    }
+
+    // Chờ nút chuyển sang xanh (active) tối đa maxWaitMs ms
+    async function waitForLayMaBtnActive(maxWaitMs) {
+        maxWaitMs = maxWaitMs || 90000;
+        const start = Date.now();
+        let firstCountdown = true;
+        while (Date.now() - start < maxWaitMs) {
+            await workerSleep(500);
+            const btn = findLayMaBtn();
+            if (!btn) continue;
+            if (isLayMaBtnActive(btn)) {
+                console.log('[LAYMA v2.5] Button is now ACTIVE (green)!');
+                return btn;
+            }
+            // Lần đầu thấy countdown -> ghi vào localStorage để overlay hiện
+            if (firstCountdown) {
+                const ctrVal = getCounterValue();
+                if (ctrVal > 0) {
+                    firstCountdown = false;
+                    const endTime = Date.now() + ctrVal*1000;
+                    try {
+                        localStorage.setItem(COUNTDOWN_KEY, endTime.toString());
+                        if (window.opener && !window.opener.closed)
+                            window.opener.localStorage.setItem(COUNTDOWN_KEY, endTime.toString());
+                    } catch(_) {}
+                }
+            }
+            const elapsed = Date.now() - start;
+            if (elapsed % 5000 < 600) {
+                const ctrVal = getCounterValue();
+                showToast('⏳ Chờ nút active... ' + (ctrVal > 0 ? ctrVal+'s' : Math.round((maxWaitMs-elapsed)/1000)+'s còn lại'));
+            }
+        }
+        return null;
+    }
+
+    function readCountdownFromBtn() {
+        for (const el of document.querySelectorAll('span, div, button')) {
+            const text = (el.innerText||el.textContent||'').trim();
+            const m = text.match(/(?:lấy mã sau|lay ma sau|Lấy mã sau)\s*(\d+)/i);
+            if (m) return parseInt(m[1]);
+        }
+        const ctr = document.querySelector('#counter');
+        if (ctr) { const v = parseInt((ctr.textContent||'').trim()); if (v > 0) return v; }
+        return 0;
+    }
+    function getMessageBoxText() {
+        const msg = document.querySelector('#message');
+        if (!msg) return '';
+        let text = '';
+        for (const node of msg.childNodes) { if (node.nodeType===Node.TEXT_NODE) text += node.textContent; }
+        return text.trim();
+    }
+    function getCounterValue() {
+        const ctr = document.querySelector('#counter');
+        if (!ctr) return -1;
+        return parseInt((ctr.textContent||'').trim()) || 0;
+    }
+    function isChallengeOverlayVisible() {
+        const msg = document.querySelector('#message');
+        if (!msg) return false;
+        let parent = msg.parentElement;
+        while (parent && parent !== document.body) {
+            const computed = window.getComputedStyle(parent);
+            if (computed.position === 'fixed') {
+                if (computed.display==='none'||computed.visibility==='hidden') return false;
+                const rect = parent.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) return true;
+                return false;
+            }
+            parent = parent.parentElement;
+        }
+        return isElementVisible(msg);
+    }
+    function isHcaptchaModalVisible() {
+        const modal = document.querySelector('#hcaptcha-modal-content');
+        if (!modal) return false;
+        return isElementVisible(modal);
+    }
+    function isHcaptchaSolved() {
+        for (const s of ['textarea[name="h-captcha-response"]','textarea[id^="h-captcha-response"]',
+            'textarea[name="g-recaptcha-response"]','textarea[id^="g-recaptcha-response"]']) {
+            const el = document.querySelector(s); if (el && el.value && el.value.length > 10) return true;
+        }
+        return false;
+    }
+    function findModalConfirmBtn() {
+        const modal = document.querySelector('#hcaptcha-modal-content');
+        if (modal) {
+            for (const b of modal.querySelectorAll('button')) {
+                const bg = window.getComputedStyle(b).backgroundColor;
+                if (bg.includes('11, 244, 5')||bg.includes('11,244,5')) return b;
+            }
+            const firstBtn = modal.querySelector('button'); if (firstBtn) return firstBtn;
+        }
+        const xBtn = document.querySelector('#xacthucButton');
+        if (xBtn && isElementVisible(xBtn)) return xBtn;
+        return null;
+    }
+    function extractCodeFromMessage() {
+        const msg = document.querySelector('#message'); if (!msg) return null;
+        let text = '';
+        for (const node of msg.childNodes) { if (node.nodeType===Node.TEXT_NODE) text += node.textContent; }
+        text = text.trim();
+        const m = text.match(/(?:mã code|ma code|code)[:\s]+([A-Za-z0-9]{4,20})/i);
+        if (m) return m[1].trim();
+        const words = text.split(/[\s:]+/);
+        for (let i = words.length-1; i >= 0; i--) {
+            const w = words[i].trim();
+            if (/^[A-Za-z0-9]{4,12}$/.test(w) && !/^(code|mã|ma|và|lấy|lay|vào|vao)$/i.test(w)) return w;
+        }
+        return null;
+    }
+    function showToast(msg) {
+        document.querySelectorAll('.__layma_toast__').forEach(t => t.remove());
+        const t = document.createElement('div');
+        t.className = '__layma_toast__';
+        t.textContent = msg;
+        t.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,#0d1a0d,#0f2211);border:1px solid rgba(11,244,5,.35);color:#0bf405;font-family:"Share Tech Mono",monospace;font-size:12px;padding:12px 24px;border-radius:12px;z-index:99999999;box-shadow:0 4px 32px rgba(0,0,0,.6);white-space:pre-line;text-align:center;line-height:1.7;backdrop-filter:blur(8px);max-width:400px;pointer-events:none;';
+        document.body.appendChild(t);
+        setTimeout(() => { t.style.transition = 'opacity .4s'; t.style.opacity = '0'; setTimeout(() => t.remove(), 400); }, 3500);
+    }
+    function simulateTapScreen() {
+        const messageOverlay = document.querySelector('#message');
+        let overlayRect = null;
+        if (messageOverlay) {
+            let p = messageOverlay;
+            while (p && p !== document.body) {
+                const s = window.getComputedStyle(p);
+                if (s.position==='fixed') { overlayRect = p.getBoundingClientRect(); break; }
+                p = p.parentElement;
+            }
+        }
+        const points = [];
+        const W = window.innerWidth, H = window.innerHeight;
+        for (let x = 0.15; x <= 0.85; x += 0.35) {
+            for (let y = 0.1; y <= 0.9; y += 0.2) { points.push({ x:W*x, y:H*y }); }
+        }
+        let clicked = false;
+        for (const pt of points) {
+            if (overlayRect && pt.x>=overlayRect.left && pt.x<=overlayRect.right && pt.y>=overlayRect.top && pt.y<=overlayRect.bottom) continue;
+            const target = document.elementFromPoint(pt.x, pt.y); if (!target) continue;
+            if (target.closest('#message')||target.closest('#hcaptcha-modal-content')) continue;
+            if (target.id==='counter'||target.id==='xacthucButton') continue;
+            ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(ev => {
+                try {
+                    const Ctor = ev.startsWith('pointer') ? PointerEvent : MouseEvent;
+                    target.dispatchEvent(new Ctor(ev, { bubbles:true, cancelable:true, view:window, clientX:pt.x, clientY:pt.y }));
+                } catch(_) {}
+            });
+            try {
+                const touch = new Touch({ identifier:Date.now(), target, clientX:pt.x, clientY:pt.y });
+                target.dispatchEvent(new TouchEvent('touchstart', { bubbles:true, cancelable:true, touches:[touch], changedTouches:[touch] }));
+                target.dispatchEvent(new TouchEvent('touchend', { bubbles:true, cancelable:true, touches:[], changedTouches:[touch] }));
+            } catch(_) {}
+            clicked = true; break;
+        }
+        if (!clicked) {
+            try { document.body.dispatchEvent(new MouseEvent('click', { bubbles:true, cancelable:true, clientX:50, clientY:50 })); } catch(_) {}
+            try { document.body.click(); } catch(_) {}
+        }
+    }
+    function simulateScrollUp() {
+        window.scrollTo({ top:0, behavior:'smooth' });
+        for (let i = 0; i < 5; i++) {
+            setTimeout(() => {
+                window.dispatchEvent(new Event('scroll', { bubbles:true }));
+                try { window.dispatchEvent(new WheelEvent('wheel', { deltaY:-800, bubbles:true })); } catch(_) {}
+            }, i*100);
+        }
+    }
+    function simulateScrollDown() {
+        const scrollHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+        window.scrollTo({ top:scrollHeight, behavior:'smooth' });
+        for (let i = 0; i < 5; i++) {
+            setTimeout(() => {
+                window.dispatchEvent(new Event('scroll', { bubbles:true }));
+                try { window.dispatchEvent(new WheelEvent('wheel', { deltaY:800, bubbles:true })); } catch(_) {}
+            }, i*100);
+        }
+    }
+    function clickAnyPostElement() {
+        const selectors = ['article','.post','.entry','[class*="post"]','[class*="article"]','.card','.blog-post'];
+        for (const sel of selectors) {
+            for (const el of document.querySelectorAll(sel)) {
+                if (!isElementVisible(el)) continue;
+                if (el.closest('#message')||el.closest('#hcaptcha-modal-content')) continue;
+                if (window.getComputedStyle(el).position==='fixed') continue;
+                simClick(el); return true;
+            }
+        }
+        for (const a of document.querySelectorAll('a[href]')) {
+            if (!isElementVisible(a)) continue;
+            const href = a.href||'';
+            if (href.includes('layma.net')||href.includes('facebook.com')) continue;
+            if (a.closest('#message')||a.closest('#hcaptcha-modal-content')) continue;
+            if (window.getComputedStyle(a).position==='fixed') continue;
+            simClick(a); return true;
+        }
+        document.body.click(); return false;
+    }
+    function waitForElement(selector, timeout) {
+        return new Promise(resolve => {
+            const check = () => { const el = document.querySelector(selector); if (el && isElementVisible(el)) resolve(el); };
+            check();
+            const obs = new MutationObserver(check);
+            if (document.body) obs.observe(document.body, { childList:true, subtree:true, attributes:true });
+            setTimeout(() => { obs.disconnect(); resolve(null); }, timeout||10000);
+        });
+    }
+
+    // ─── CHALLENGE HANDLER ────────────────────────────────────────────────
+    let _lastChallengeType = '';
+    let _lastChallengeTime = 0;
+    async function handleChallengeMessage(msgText, ctrVal) {
+        const now = Date.now();
+        const textLower = msgText.toLowerCase();
+        if (textLower.includes('chạm vào màn hình')||textLower.includes('cham vao man hinh')||textLower.includes('chạm vào')||textLower.includes('tap')) {
+            if (_lastChallengeType==='tap' && now-_lastChallengeTime < 2000) return;
+            _lastChallengeType = 'tap'; _lastChallengeTime = now;
+            showToast('🖐 Challenge: Tap screen...'); await workerSleep(300); simulateTapScreen(); await workerSleep(1000); return;
+        }
+        if (textLower.includes('cuộn lên')||textLower.includes('cuon len')||textLower.includes('scroll up')) {
+            if (_lastChallengeType==='scrollUp' && now-_lastChallengeTime < 2000) return;
+            _lastChallengeType = 'scrollUp'; _lastChallengeTime = now;
+            showToast('⬆ Challenge: Scroll UP...'); simulateScrollUp(); await workerSleep(1500); return;
+        }
+        if (textLower.includes('cuộn xuống')||textLower.includes('cuon xuong')||textLower.includes('scroll down')) {
+            if (_lastChallengeType==='scrollDown' && now-_lastChallengeTime < 2000) return;
+            _lastChallengeType = 'scrollDown'; _lastChallengeTime = now;
+            showToast('⬇ Challenge: Scroll DOWN...'); simulateScrollDown(); await workerSleep(1500); return;
+        }
+        if (textLower.includes('nhấn bài viết')||textLower.includes('nhan bai viet')||textLower.includes('bài viết bất kỳ')||textLower.includes('bai viet bat ky')) {
+            if (_lastChallengeType==='clickPost' && now-_lastChallengeTime < 4000) return;
+            _lastChallengeType = 'clickPost'; _lastChallengeTime = now;
+            showToast('📄 Challenge: Click post -> reload...');
+            clickAnyPostElement(); await workerSleep(1000);
+            sessionStorage.setItem('layma_reload_flow','1'); location.reload(); return;
+        }
+    }
+
+    // ─── POST-COUNTDOWN HANDLER ───────────────────────────────────────────
+    async function handlePostCountdown() {
+        showToast('⏱ Countdown done, checking state...');
+        await workerSleep(1500);
+        for (let attempt = 0; attempt < 180; attempt++) {
+            await workerSleep(400);
+            const code = extractCodeFromMessage();
+            if (code && getCounterValue() <= 0) { showToast('✅ CODE FOUND: ' + code); await _sendCodeBack(code); return; }
+            if (isHcaptchaModalVisible()) {
+                showToast('🔒 hCaptcha modal detected! Waiting...');
+                for (let cap = 0; cap < 600; cap++) {
+                    await workerSleep(500);
+                    if (isHcaptchaSolved()) {
+                        showToast('✅ hCaptcha solved! Clicking confirm...');
+                        await workerSleep(800);
+                        const confirmBtn = findModalConfirmBtn();
+                        if (confirmBtn) { simClick(confirmBtn); showToast('Clicked confirm'); }
+                        await workerSleep(3000);
+                        const xBtn = document.querySelector('#xacthucButton');
+                        if (xBtn && isElementVisible(xBtn)) { simClick(xBtn); await workerSleep(2500); }
+                        for (let retry = 0; retry < 10; retry++) {
+                            await workerSleep(500);
+                            const codeAfterCap = extractCodeFromMessage();
+                            if (codeAfterCap) { showToast('✅ CODE: ' + codeAfterCap); await _sendCodeBack(codeAfterCap); return; }
+                        }
+                        break;
+                    }
+                }
+                continue;
+            }
+            if (isChallengeOverlayVisible()) {
+                const msgText = getMessageBoxText();
+                const ctrVal  = getCounterValue();
+                const codeInMsg = extractCodeFromMessage();
+                if (codeInMsg && ctrVal <= 0) { showToast('✅ CODE: ' + codeInMsg); await _sendCodeBack(codeInMsg); return; }
+                showToast((ctrVal >= 0 ? ctrVal+'s' : '') + ' | ' + msgText.substring(0,50));
+                await handleChallengeMessage(msgText, ctrVal);
+            }
+            const xBtn = document.querySelector('#xacthucButton');
+            if (xBtn && isElementVisible(xBtn)) {
+                showToast('Clicking Xac Thuc button...');
+                simClick(xBtn); await workerSleep(3000);
+                const c2 = extractCodeFromMessage();
+                if (c2) { showToast('✅ CODE: ' + c2); await _sendCodeBack(c2); return; }
+            }
+            if (getCounterValue() <= 0) {
+                const fullText = (document.body.innerText||document.body.textContent||'');
+                const codeMatch = fullText.match(/(?:mã code|ma code|code)[:\s]+([A-Za-z0-9]{4,20})/i);
+                if (codeMatch) { showToast('✅ CODE (page scan): ' + codeMatch[1]); await _sendCodeBack(codeMatch[1]); return; }
+            }
+        }
+        showToast('❌ Could not auto-get code. Check manually.');
+    }
+
+    // ─── COUNTDOWN LOOP ───────────────────────────────────────────────────
+    async function runCountdownLoop(countdownSec) {
+        _lastChallengeType = '';
+        const startMs = Date.now(), totalMs = countdownSec*1000;
+        while (Date.now()-startMs < totalMs+10000) {
+            await workerSleep(350);
+            if (isHcaptchaModalVisible()) {
+                showToast('🔒 hCaptcha during countdown!');
+                for (let cap = 0; cap < 600; cap++) {
+                    await workerSleep(500);
+                    if (isHcaptchaSolved()) {
+                        showToast('✅ hCaptcha solved!'); await workerSleep(700);
+                        const confirmBtn = findModalConfirmBtn(); if (confirmBtn) simClick(confirmBtn);
+                        await workerSleep(2500); break;
+                    }
+                }
+                continue;
+            }
+            if (isChallengeOverlayVisible()) {
+                const msgText = getMessageBoxText();
+                const ctrVal  = getCounterValue();
+                const ec = extractCodeFromMessage();
+                if (ec && ctrVal <= 0) { showToast('✅ CODE: ' + ec); await _sendCodeBack(ec); return; }
+                showToast((ctrVal >= 0 ? ctrVal+'s' : '') + ' | ' + msgText.substring(0,50));
+                await handleChallengeMessage(msgText, ctrVal);
+            } else {
+                if (Date.now()-startMs >= totalMs) break;
+                const remaining = Math.ceil((totalMs-(Date.now()-startMs))/1000);
+                if (remaining % 10 === 0 || remaining <= 5) showToast('⏳ ' + remaining + 's...');
+            }
+            const xBtn = document.querySelector('#xacthucButton');
+            if (xBtn && isElementVisible(xBtn)) {
+                showToast('Clicking Xac Thuc...');
+                simClick(xBtn); await workerSleep(3000);
+                const c2 = extractCodeFromMessage();
+                if (c2) { showToast('✅ CODE: ' + c2); await _sendCodeBack(c2); return; }
+            }
+        }
+        try {
+            localStorage.removeItem(COUNTDOWN_KEY);
+            if (window.opener && !window.opener.closed) window.opener.localStorage.removeItem(COUNTDOWN_KEY);
+        } catch(_) {}
+        await handlePostCountdown();
+    }
+
+    // ─── RELOAD FLOW ──────────────────────────────────────────────────────
+    async function handleReloadedTargetSite() {
+        preventThrottling();
+        showToast('🔄 Page reloaded — re-entering flow...');
+        await waitForPageLoad();
+        showToast('✅ Page loaded, scrolling down...');
+        await workerSleep(2000);
+        await scrollToBottom();
+        await workerSleep(1500);
+
+        // Tìm nút (bất kể màu)
+        let layMaBtn = null;
+        for (let i = 0; i < 30; i++) {
+            layMaBtn = findLayMaBtn();
+            if (layMaBtn) break;
+            if (i===10) { simulateScrollDown(); await workerSleep(800); }
+            if (i===20) { simulateScrollUp(); await workerSleep(800); simulateScrollDown(); }
+            await workerSleep(600);
+        }
+        if (!layMaBtn) { showToast('❌ Cannot find LAY MA after reload!'); await handlePostCountdown(); return; }
+
+        // Chờ nút active nếu cần
+        if (!isLayMaBtnActive(layMaBtn)) {
+            showToast('🔴 Nút đỏ, chờ active...');
+            const activeBtn = await waitForLayMaBtnActive(120000);
+            layMaBtn = activeBtn || findLayMaBtn() || layMaBtn;
+        }
+
+        layMaBtn.scrollIntoView({ behavior:'smooth', block:'center' });
+        await workerSleep(800);
+        showToast('Found LAY MA (reload), clicking...');
+        simClick(layMaBtn);
+        await workerSleep(2000);
+
+        let countdownSec = 0;
+        for (let i = 0; i < 30; i++) {
+            await workerSleep(500);
+            countdownSec = readCountdownFromBtn();
+            if (countdownSec > 0) break;
+            const ctrVal = getCounterValue();
+            if (ctrVal > 0) { countdownSec = ctrVal; break; }
+        }
+        if (countdownSec <= 2) { showToast('Countdown done, checking...'); await handlePostCountdown(); return; }
+
+        const endTime = Date.now() + countdownSec*1000;
+        try {
+            localStorage.setItem(COUNTDOWN_KEY, endTime.toString());
+            if (window.opener && !window.opener.closed) window.opener.localStorage.setItem(COUNTDOWN_KEY, endTime.toString());
+        } catch(_) {}
+        showToast('⏳ Countdown: ' + countdownSec + 's (reload)');
+        await runCountdownLoop(countdownSec);
+    }
+
+    // ─── MAIN FLOW ON TARGET SITE ─────────────────────────────────────────
+    async function clickOnTargetSite() {
+        window.name = '';
+        preventThrottling();
+        showToast('🚀 Tab opened. Waiting for page load...');
+
+        await waitForPageLoad();
+        showToast('✅ Page loaded! Waiting 3s...');
+        await workerSleep(3000);
+
+        await scrollToBottom();
+        await workerSleep(1000);
+
+        // Tìm nút (bất kể màu) — nhiều lần, scroll lại nếu cần
+        let layMaBtn = null;
+        for (let i = 0; i < 40; i++) {
+            layMaBtn = findLayMaBtn();
+            if (layMaBtn) { console.log('[LAYMA v2.5] LAY MA found on attempt', i+1); break; }
+            if (i===8)  { showToast('Retry: scroll bottom again...'); await scrollToBottom(); }
+            else if (i===18) { showToast('Retry: scroll up then down...'); simulateScrollUp(); await workerSleep(1000); await scrollToBottom(); }
+            else if (i===28) { showToast('Retry: scroll to middle...'); window.scrollTo({ top:document.body.scrollHeight/2, behavior:'smooth' }); await workerSleep(800); await scrollToBottom(); }
+            await workerSleep(500);
+        }
+
+        // Last resort: tìm span có cursor:pointer + text LẤY MÃ (bất kể style)
+        if (!layMaBtn) {
+            showToast('⚠ Last resort scan...');
+            for (const el of document.querySelectorAll('span,div,button')) {
+                const cs = window.getComputedStyle(el);
+                if (cs.cursor !== 'pointer') continue;
+                const text = (el.innerText||el.textContent||'').trim();
+                if (text === 'LẤY MÃ' && text.length < 10) { layMaBtn = el; showToast('Found by last resort: ' + el.tagName); break; }
+            }
+        }
+
+        if (!layMaBtn) { showToast('❌ LAY MA button not found. Aborting.'); return; }
+
+        // Nếu nút chưa active -> chờ
+        if (!isLayMaBtnActive(layMaBtn)) {
+            showToast('🔴 Nút đang đỏ. Chờ chuyển xanh...');
+            const activeBtn = await waitForLayMaBtnActive(120000);
+            if (!activeBtn) { showToast('⚠ Timeout chờ active. Click anyway...'); layMaBtn = findLayMaBtn() || layMaBtn; }
+            else layMaBtn = activeBtn;
+        }
+
+        try { layMaBtn.scrollIntoView({ behavior:'smooth', block:'center' }); } catch(_) {}
+        await workerSleep(800);
+        showToast('✅ Clicking LẤY MÃ...');
+        simClick(layMaBtn);
+        await workerSleep(2000);
+
+        // Đọc countdown
+        let countdownSec = 0;
+        for (let i = 0; i < 40; i++) {
+            await workerSleep(500);
+            countdownSec = readCountdownFromBtn();
+            if (countdownSec > 0) break;
+            const ctrVal = getCounterValue();
+            if (ctrVal > 0) { countdownSec = ctrVal; break; }
+            if (isChallengeOverlayVisible() && getCounterValue() === 0) {
+                const code = extractCodeFromMessage();
+                if (code) { showToast('✅ CODE (immediate): ' + code); await _sendCodeBack(code); return; }
+            }
+        }
+        if (!countdownSec || countdownSec <= 0) { showToast('⚠ Cannot read countdown! Trying post-countdown...'); await handlePostCountdown(); return; }
+
+        const endTime = Date.now() + countdownSec*1000;
+        try {
+            localStorage.setItem(COUNTDOWN_KEY, endTime.toString());
+            if (window.opener && !window.opener.closed) window.opener.localStorage.setItem(COUNTDOWN_KEY, endTime.toString());
+        } catch(_) {}
+        showToast('⏳ Countdown: ' + countdownSec + 's — watching...');
+        await runCountdownLoop(countdownSec);
+    }
+
+    // ─── SEND CODE BACK ───────────────────────────────────────────────────
+    async function _sendCodeBack(code) {
+        try { GM_setClipboard(code); } catch { try { await navigator.clipboard.writeText(code); } catch(_) {} }
+        if (window.opener && !window.opener.closed) {
+            try {
+                window.opener.localStorage.setItem(CODE_KEY, code);
+                window.opener.dispatchEvent(new window.opener.StorageEvent('storage', { key:CODE_KEY, newValue:code, storageArea:window.opener.localStorage }));
+            } catch {
+                try { window.opener.postMessage({ type:'LAYMA_CODE', code }, '*'); } catch(_) {}
+            }
+        } else { localStorage.setItem(CODE_KEY, code); }
+        showToast('✅ CODE: ' + code + '\nCopied! Sending to layma tab...\nClosing in 3s...');
+        await workerSleep(3000);
+        try { window.close(); } catch(_) {}
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  ★★★  MINI FLOATING MENU (chỉ chạy ở trang đích, không phải layma.net)
+    //
+    //  - Mặc định: hình tròn nhỏ màu xanh lá, góc dưới phải
+    //  - Click vào: mở ra panel vuông nhỏ
+    //  - Chức năng: Import HTML nút LẤY MÃ từ F12 để lưu fingerprint
+    //  - Fingerprint được lưu theo hostname, dùng lại lần sau tự động
+    //  - KHÔNG ảnh hưởng gì đến menu chính của layma.net
+    // ══════════════════════════════════════════════════════════════════════
+    function createMiniMenu() {
+        const currentHost = location.hostname;
+
+        GM_addStyle(`
+        #lm-mini-fab {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            width: 38px;
+            height: 38px;
+            border-radius: 50%;
+            background: #0bf405;
+            box-shadow: 0 2px 12px rgba(11,244,5,.5), 0 0 0 2px rgba(11,244,5,.2);
+            cursor: pointer;
+            z-index: 99999998;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            transition: transform .18s, box-shadow .18s;
+            user-select: none;
+            border: none;
+            outline: none;
+        }
+        #lm-mini-fab:hover {
+            transform: scale(1.12);
+            box-shadow: 0 4px 20px rgba(11,244,5,.7), 0 0 0 3px rgba(11,244,5,.3);
+        }
+        #lm-mini-panel {
+            position: fixed;
+            bottom: 72px;
+            right: 24px;
+            width: 240px;
+            background: #0d1a0d;
+            border: 1px solid rgba(11,244,5,.35);
+            border-radius: 10px;
+            box-shadow: 0 8px 32px rgba(0,0,0,.7), 0 0 0 1px rgba(11,244,5,.07);
+            z-index: 99999997;
+            display: none;
+            flex-direction: column;
+            font-family: 'Share Tech Mono', monospace;
+            overflow: hidden;
+        }
+        #lm-mini-panel.open { display: flex; }
+        #lm-mini-panel-hdr {
+            background: linear-gradient(90deg,rgba(11,244,5,.1),rgba(0,229,255,.05));
+            border-bottom: 1px solid rgba(11,244,5,.15);
+            padding: 7px 10px;
+            font-size: 9px;
+            color: #0bf405;
+            letter-spacing: 2px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        #lm-mini-close {
+            cursor: pointer;
+            color: #444;
+            font-size: 11px;
+            background: none;
+            border: none;
+            padding: 0 2px;
+        }
+        #lm-mini-close:hover { color: #ff4444; }
+        #lm-mini-body { padding: 8px 9px; display: flex; flex-direction: column; gap: 6px; }
+        #lm-mini-status {
+            font-size: 8px;
+            color: #555;
+            min-height: 14px;
+            word-break: break-all;
+            text-align: center;
+        }
+        #lm-mini-status.ok  { color: #0bf405; }
+        #lm-mini-status.err { color: #ff4444; }
+        #lm-mini-textarea {
+            width: 100%;
+            height: 70px;
+            background: #091409;
+            border: 1px solid rgba(11,244,5,.15);
+            border-radius: 6px;
+            color: #0bf405;
+            font-size: 8px;
+            font-family: 'Share Tech Mono', monospace;
+            padding: 5px 6px;
+            resize: none;
+            outline: none;
+        }
+        #lm-mini-textarea:focus { border-color: rgba(11,244,5,.4); }
+        #lm-mini-textarea::placeholder { color: #2a2a2a; }
+        .lm-mini-btn {
+            width: 100%;
+            padding: 5px 0;
+            border-radius: 6px;
+            border: 1px solid rgba(11,244,5,.25);
+            background: rgba(11,244,5,.07);
+            color: #0bf405;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 8.5px;
+            cursor: pointer;
+            transition: all .15s;
+            letter-spacing: .5px;
+        }
+        .lm-mini-btn:hover { background: rgba(11,244,5,.15); border-color: rgba(11,244,5,.5); }
+        .lm-mini-btn.del { background: rgba(255,60,60,.06); border-color: rgba(255,60,60,.2); color: #ff6666; }
+        .lm-mini-btn.del:hover { background: rgba(255,60,60,.15); }
+        #lm-mini-saved-info {
+            font-size: 7.5px;
+            color: #333;
+            text-align: center;
+            padding: 2px 0;
+            border-top: 1px solid rgba(11,244,5,.08);
+        }
+        #lm-mini-saved-info.has-fp { color: #4ade80; }
+        `);
+
+        // FAB (hình tròn)
+        const fab = document.createElement('button');
+        fab.id = 'lm-mini-fab';
+        fab.title = 'Layma Mini Menu';
+        fab.innerHTML = '⚡';
+        document.body.appendChild(fab);
+
+        // Panel
+        const panel = document.createElement('div');
+        panel.id = 'lm-mini-panel';
+        panel.innerHTML = `
+        <div id="lm-mini-panel-hdr">
+            <span>LAYMA MINI v2.5</span>
+            <button id="lm-mini-close">✕</button>
+        </div>
+        <div id="lm-mini-body">
+            <div id="lm-mini-saved-info">Chưa có fingerprint lưu</div>
+            <div id="lm-mini-status"></div>
+            <textarea id="lm-mini-textarea" placeholder="Paste HTML nút LẤY MÃ từ F12 vào đây...&#10;Ví dụ: &lt;span style=&quot;background:rgb(11,244,5)...&quot;&gt;&lt;span&gt;LẤY MÃ&lt;/span&gt;&lt;/span&gt;"></textarea>
+            <button class="lm-mini-btn" id="lm-mini-save">💾 Lưu fingerprint nút này</button>
+            <button class="lm-mini-btn" id="lm-mini-test">🔍 Test tìm nút ngay</button>
+            <button class="lm-mini-btn del" id="lm-mini-del">🗑 Xóa fingerprint đã lưu</button>
+        </div>`;
+        document.body.appendChild(panel);
+
+        // Helpers
+        const statusEl  = panel.querySelector('#lm-mini-status');
+        const savedInfo = panel.querySelector('#lm-mini-saved-info');
+        const textarea  = panel.querySelector('#lm-mini-textarea');
+
+        function setStatus(msg, type) {
+            statusEl.textContent = msg;
+            statusEl.className = type || '';
+        }
+        function refreshSavedInfo() {
+            const fp = loadBtnFingerprint(currentHost);
+            if (fp) {
+                savedInfo.textContent = `✅ Đã lưu: "${fp.btnText}" | bg:${fp.bgColor}`;
+                savedInfo.className = 'has-fp';
+            } else {
+                savedInfo.textContent = 'Chưa có fingerprint cho host này';
+                savedInfo.className = '';
+            }
+        }
+        refreshSavedInfo();
+
+        // Toggle panel
+        fab.onclick = () => panel.classList.toggle('open');
+        panel.querySelector('#lm-mini-close').onclick = () => panel.classList.remove('open');
+
+        // Lưu fingerprint từ HTML paste
+        panel.querySelector('#lm-mini-save').onclick = () => {
+            const html = textarea.value.trim();
+            if (!html) { setStatus('Paste HTML vào trước!', 'err'); return; }
+            const fp = parseBtnHTML(html);
+            if (!fp) { setStatus('Không parse được HTML. Kiểm tra lại!', 'err'); return; }
+            if (!fp.btnText) { setStatus('Không tìm thấy text nút trong HTML!', 'err'); return; }
+            saveBtnFingerprint(currentHost, fp);
+            setStatus(`Đã lưu! Text="${fp.btnText}" | bg=${fp.bgColor}`, 'ok');
+            refreshSavedInfo();
+            textarea.value = '';
+            console.log('[LAYMA v2.5] Saved fingerprint:', fp);
+        };
+
+        // Test tìm nút ngay lập tức
+        panel.querySelector('#lm-mini-test').onclick = () => {
+            const btn = findLayMaBtn();
+            if (btn) {
+                const bg = window.getComputedStyle(btn).backgroundColor;
+                const text = (btn.textContent||'').trim().substring(0,20);
+                setStatus(`✅ Tìm thấy: "${text}" | bg:${bg}`, 'ok');
+                // Highlight tạm thời
+                const orig = btn.style.outline;
+                btn.style.outline = '3px solid red';
+                setTimeout(() => { btn.style.outline = orig; }, 2000);
+            } else {
+                setStatus('❌ Không tìm thấy nút!', 'err');
+            }
+        };
+
+        // Xóa fingerprint
+        panel.querySelector('#lm-mini-del').onclick = () => {
+            const m = getBtnImportMap();
+            if (m[currentHost]) {
+                delete m[currentHost];
+                saveBtnImportMap(m);
+                setStatus('Đã xóa fingerprint!', 'ok');
+                refreshSavedInfo();
+            } else {
+                setStatus('Chưa có gì để xóa.', '');
+            }
+        };
+    }
+
+    // ─── LAYMA.NET UI ─────────────────────────────────────────────────────
+    function createUI() {
+        const fontLink = document.createElement('link');
+        fontLink.rel = 'stylesheet';
+        fontLink.href = 'https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Share+Tech+Mono&family=Rajdhani:wght@500;700&display=swap';
+        document.head.appendChild(fontLink);
+
+        GM_addStyle(`
+        #layma-shell-v2 *, #layma-shell-v2 *::before, #layma-shell-v2 *::after { box-sizing:border-box; }
+        #layma-shell-v2 {
+            --g1:#0bf405; --g2:#00e5ff; --g3:#7c3aed;
+            --bg0:#050f05; --bg1:#091409; --bg2:#0d1a0d; --bg3:#122212;
+            --border:rgba(11,244,5,.15); --shadow:0 8px 32px rgba(0,0,0,.8),0 0 0 1px rgba(11,244,5,.07);
+            position:fixed; top:55px; right:12px; width:240px;
+            background:var(--bg0); border:1px solid var(--border); border-radius:14px;
+            z-index:9999999; overflow:hidden; box-shadow:var(--shadow);
+            transition:width .22s cubic-bezier(.4,0,.2,1); min-width:150px;
+            font-family:'Rajdhani',sans-serif; backdrop-filter:blur(14px);
+        }
+        #layma-shell-v2::before {
+            content:''; position:absolute; left:0; right:0; top:-100%; height:2px;
+            background:linear-gradient(90deg,transparent,var(--g1),transparent); opacity:.4;
+            animation:scanLM2 4s ease-in-out infinite; pointer-events:none; z-index:1000;
+        }
+        @keyframes scanLM2 { 0%{top:-5px;opacity:0} 5%{opacity:.4} 95%{opacity:.4} 100%{top:105%;opacity:0} }
+        #layma-hdr-v2 {
+            display:flex; align-items:center; justify-content:space-between; padding:8px 10px 7px;
+            background:linear-gradient(90deg,rgba(11,244,5,.07),rgba(0,229,255,.04),rgba(124,58,237,.04));
+            border-bottom:1px solid var(--border); cursor:move; user-select:none; touch-action:none;
+        }
+        #layma-logo-v2 { display:flex; align-items:center; gap:7px; }
+        .layma-pulse-v2 {
+            width:7px; height:7px; border-radius:50%; background:var(--g1);
+            box-shadow:0 0 8px var(--g1),0 0 18px rgba(11,244,5,.5);
+            animation:pulseLM2 1.6s ease-in-out infinite;
+        }
+        @keyframes pulseLM2 { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.3;transform:scale(.55)} }
+        #layma-title-v2 { font-family:'Orbitron',monospace; font-size:8px; font-weight:900; color:var(--g1); letter-spacing:2px; text-shadow:0 0 12px rgba(11,244,5,.6); }
+        #layma-ver-v2   { font-family:'Share Tech Mono',monospace; font-size:7px; color:rgba(0,229,255,.6); letter-spacing:1px; }
+        .layma-hdr-right-v2 { display:flex; align-items:center; gap:4px; }
+        .layma-sz-v2 {
+            background:var(--bg3); border:1px solid rgba(11,244,5,.1); border-radius:4px;
+            color:#333; width:18px; height:18px; font-size:8px; font-weight:700; cursor:pointer;
+            display:flex; align-items:center; justify-content:center; transition:all .15s;
+            font-family:'Orbitron',monospace;
+        }
+        .layma-sz-v2:hover, .layma-sz-v2.active { background:rgba(11,244,5,.12); color:var(--g1); border-color:rgba(11,244,5,.4); }
+        #layma-close-v2 {
+            background:var(--bg3); border:1px solid rgba(255,60,60,.15); border-radius:4px;
+            color:#444; width:18px; height:18px; font-size:9px; cursor:pointer;
+            display:flex; align-items:center; justify-content:center; transition:all .15s;
+        }
+        #layma-close-v2:hover { background:rgba(255,60,60,.15); color:#ff4040; }
+        #layma-body-v2 { padding:8px 9px 7px; display:flex; flex-direction:column; gap:5px; }
+        .layma-lbl-v2 {
+            font-family:'Share Tech Mono',monospace; font-size:7px; color:rgba(11,244,5,.45);
+            letter-spacing:2px; text-transform:uppercase; margin-bottom:2px;
+        }
+        #layma-shell-v2 input[type=text] {
+            width:100%; background:var(--bg2); border:1px solid rgba(11,244,5,.12);
+            border-radius:6px; color:var(--g1); font-family:'Share Tech Mono',monospace;
+            font-size:9.5px; padding:5px 7px; outline:none; transition:border-color .2s,box-shadow .2s;
+        }
+        #layma-shell-v2 input[type=text]:focus { border-color:rgba(11,244,5,.4); box-shadow:0 0 0 2px rgba(11,244,5,.07); }
+        #layma-status-v2 {
+            background:rgba(11,244,5,.04); border:1px solid rgba(11,244,5,.1); border-radius:7px;
+            padding:6px 8px; font-family:'Share Tech Mono',monospace; font-size:8px; color:#444;
+            min-height:22px; word-break:break-all; display:none;
+        }
+        #layma-status-v2.active { display:block; color:var(--g2); }
+        #layma-status-v2.ok     { display:block; color:var(--g1); }
+        #layma-status-v2.err    { display:block; color:#ff4444; }
+        .layma-btn-row-v2 { display:flex; gap:4px; }
+        .layma-btn-v2 {
+            flex:1; padding:6px 0; border-radius:7px; border:1px solid transparent;
+            font-family:'Orbitron',monospace; font-weight:700; font-size:7.5px;
+            letter-spacing:.8px; cursor:pointer; transition:all .18s;
+        }
+        .layma-btn-v2:active { transform:scale(.95); }
+        .layma-btn-v2:hover  { filter:brightness(1.18); }
+        #layma-btn-imgs-v2 { background:linear-gradient(135deg,#0a2218,#0d3326); color:#4ade80; border-color:rgba(74,222,128,.2); }
+        #layma-btn-scan-v2 { background:linear-gradient(135deg,#0f3d0f,#1a5c1a); color:#0bf405; border-color:rgba(11,244,5,.3); box-shadow:0 2px 12px rgba(11,244,5,.2); }
+        #layma-btn-open-v2 { background:linear-gradient(135deg,#0e1a3d,#1a2d6e); color:#60a5fa; border-color:rgba(96,165,250,.25); }
+        .layma-io-row-v2 { display:flex; gap:4px; }
+        .layma-io-btn-v2 {
+            flex:1; padding:4px 0; border-radius:6px; font-family:'Share Tech Mono',monospace;
+            font-size:8.5px; cursor:pointer; transition:all .18s; text-align:center;
+        }
+        #layma-btn-export-v2 { background:rgba(11,244,5,.06);  color:#4ade80; border:1px solid rgba(11,244,5,.15); }
+        #layma-btn-import-v2 { background:rgba(0,229,255,.06);  color:#67e8f9; border:1px solid rgba(0,229,255,.15); }
+        .layma-scroll-v2 {
+            max-height:110px; overflow-y:auto; background:var(--bg2); border:1px solid var(--border);
+            border-radius:7px; padding:4px 5px; scrollbar-width:thin;
+            scrollbar-color:rgba(11,244,5,.3) transparent;
+        }
+        #layma-imglist-v2 { display:none; }
+        .layma-img-row-v2 {
+            background:var(--bg3); border:1px solid rgba(11,244,5,.08);
+            border-radius:6px; padding:5px 6px; margin-bottom:4px;
+        }
+        .layma-img-url-v2 {
+            width:100%; background:rgba(0,0,0,.3); border:1px solid rgba(11,244,5,.15);
+            border-radius:4px; color:var(--g1); font-family:'Share Tech Mono',monospace;
+            font-size:8.5px; padding:3px 5px; margin:3px 0; outline:none;
+        }
+        .layma-img-btn-row-v2 { display:flex; gap:3px; margin-top:2px; }
+        .layma-img-btn-v2 {
+            flex:1; background:rgba(11,244,5,.06); border:1px solid rgba(11,244,5,.15);
+            border-radius:4px; color:var(--g1); font-size:7.5px; padding:2px 0;
+            cursor:pointer; font-family:'Share Tech Mono',monospace; transition:all .15s;
+        }
+        .layma-img-btn-del-v2 { background:rgba(255,60,60,.06); border-color:rgba(255,60,60,.15); color:#ff4444; }
+        .layma-clr-btn-v2 {
+            width:100%; margin-top:4px; background:rgba(255,60,60,.05); border:1px solid rgba(255,60,60,.15);
+            border-radius:5px; color:#ff4444; font-family:'Orbitron',monospace; font-weight:700;
+            font-size:7.5px; padding:4px; cursor:pointer; letter-spacing:1px;
+        }
+        #layma-cache-v2 {
+            display:none; background:rgba(11,244,5,.07); border:1px solid rgba(11,244,5,.2);
+            border-radius:6px; padding:4px 7px; font-family:'Share Tech Mono',monospace;
+            font-size:7.5px; color:var(--g1); text-align:center;
+        }
+        #layma-autobar-v2 {
+            display:none; background:linear-gradient(90deg,rgba(11,244,5,.05),rgba(0,229,255,.04));
+            border-top:1px solid var(--border); padding:5px 10px;
+            font-family:'Share Tech Mono',monospace; font-size:7.5px; color:var(--g1);
+            text-align:center; letter-spacing:.8px;
+        }
+        .layma-divider-v2 { height:1px; background:linear-gradient(90deg,transparent,rgba(11,244,5,.12),transparent); margin:1px 0; }
+        #layma-shell-v2.sz-s { width:162px; }
+        #layma-shell-v2.sz-l { width:360px; }
+        @keyframes foundLM2 {
+            0%,100%{box-shadow:var(--shadow)}
+            50%{box-shadow:0 8px 40px rgba(0,0,0,.9),0 0 0 1px rgba(11,244,5,.35),0 0 30px rgba(11,244,5,.12)}
+        }
+        #layma-shell-v2.found-v2 { animation:foundLM2 1.5s ease-in-out 3; }
+        #layma-cand-v2 {
+            display:none; max-height:56px; overflow-y:auto; background:var(--bg2);
+            border:1px solid rgba(11,244,5,.1); border-radius:6px; padding:3px 5px;
+        }
+        .layma-cand-item {
+            font-family:'Share Tech Mono',monospace; font-size:8px; color:#444; cursor:pointer;
+            padding:2px 0; border-bottom:1px solid rgba(255,255,255,.03);
+            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+        }
+        .layma-cand-item:hover { color:var(--g1); }
+        `);
+
+        const shell = document.createElement('div');
+        shell.id = 'layma-shell-v2';
+        shell.innerHTML = `
+        <div id="layma-hdr-v2">
+            <div id="layma-logo-v2">
+                <div class="layma-pulse-v2"></div>
+                <div>
+                    <div id="layma-title-v2">LAYMA.NET</div>
+                    <div id="layma-ver-v2">AI VISION v2.5</div>
+                </div>
+            </div>
+            <div class="layma-hdr-right-v2">
+                <button class="layma-sz-v2" data-sz="s">S</button>
+                <button class="layma-sz-v2 active" data-sz="m">M</button>
+                <button class="layma-sz-v2" data-sz="l">L</button>
+                <button id="layma-close-v2">X</button>
+            </div>
+        </div>
+        <div id="layma-body-v2">
+            <div id="layma-cache-v2">Cached URL — press OPEN</div>
+            <div>
+                <div class="layma-lbl-v2">URL</div>
+                <input id="layma-url-box-v2" type="text" placeholder="https://..."/>
+            </div>
+            <div id="layma-status-v2">Ready...</div>
+            <div id="layma-cand-v2"></div>
+            <div class="layma-btn-row-v2">
+                <button id="layma-btn-imgs-v2" class="layma-btn-v2">IMGS</button>
+                <button id="layma-btn-scan-v2" class="layma-btn-v2">AI SCAN</button>
+                <button id="layma-btn-open-v2" class="layma-btn-v2">OPEN</button>
+            </div>
+            <div class="layma-divider-v2"></div>
+            <div class="layma-io-row-v2">
+                <button id="layma-btn-export-v2" class="layma-io-btn-v2">Export</button>
+                <button id="layma-btn-import-v2" class="layma-io-btn-v2">Import</button>
+                <input id="layma-import-file-v2" type="file" accept=".json" style="display:none">
+            </div>
+            <div id="layma-imglist-v2" class="layma-scroll-v2"></div>
+        </div>
+        <div id="layma-autobar-v2">Waiting for code from tab...</div>`;
+        document.body.appendChild(shell);
+
+        const statusEl   = shell.querySelector('#layma-status-v2');
+        const urlBox     = shell.querySelector('#layma-url-box-v2');
+        const imgList    = shell.querySelector('#layma-imglist-v2');
+        const autoBar    = shell.querySelector('#layma-autobar-v2');
+        const cacheBadge = shell.querySelector('#layma-cache-v2');
+        const importFile = shell.querySelector('#layma-import-file-v2');
+
+        const setStatus = (msg, type) => {
+            type = type || '';
+            statusEl.textContent = msg;
+            statusEl.className = type ? ('active '+type) : 'active';
+            if (type === 'ok') { shell.classList.add('found-v2'); setTimeout(() => shell.classList.remove('found-v2'), 4500); }
+        };
+
+        window._laymaUI = { urlBox, autoBar, setStatus, selectedImgKey:null, lastScannedImgKey:null, lastScannedImgSrc:null };
+
+        shell.querySelectorAll('.layma-sz-v2').forEach(b => {
+            b.onclick = () => {
+                const sz = b.dataset.sz;
+                shell.style.width = (sz==='s' ? 162 : sz==='l' ? 360 : 240) + 'px';
+                shell.className = 'sz-'+sz;
+                shell.querySelectorAll('.layma-sz-v2').forEach(x => x.classList.toggle('active', x.dataset.sz===sz));
+            };
+        });
+        shell.querySelector('#layma-close-v2').onclick = () => shell.remove();
+
+        let drag = false, ox = 0, oy = 0;
+        const hdr = shell.querySelector('#layma-hdr-v2');
+        hdr.onmousedown = e => { drag=true; ox=e.clientX-shell.offsetLeft; oy=e.clientY-shell.offsetTop; };
+        hdr.addEventListener('touchstart', e => { const t=e.touches[0]; drag=true; ox=t.clientX-shell.offsetLeft; oy=t.clientY-shell.offsetTop; }, { passive:true });
+        document.addEventListener('mouseup', () => drag=false);
+        document.addEventListener('touchend', () => drag=false);
+        document.addEventListener('mousemove', e => { if(!drag) return; shell.style.left=(e.clientX-ox)+'px'; shell.style.top=(e.clientY-oy)+'px'; shell.style.right='auto'; });
+        document.addEventListener('touchmove', e => { if(!drag) return; const t=e.touches[0]; shell.style.left=(t.clientX-ox)+'px'; shell.style.top=(t.clientY-oy)+'px'; shell.style.right='auto'; }, { passive:true });
+
+        shell.querySelector('#layma-btn-imgs-v2').onclick = () => {
+            const visible = imgList.style.display === 'block';
+            imgList.style.display = visible ? 'none' : 'block';
+            if (!visible) renderImgList();
+        };
+        function renderImgList() {
+            const m = getImgMap(), keys = Object.keys(m);
+            if (!keys.length) { imgList.innerHTML = '<div style="color:#444;font-size:9px;text-align:center;padding:6px;font-family:Share Tech Mono,monospace">No images yet</div>'; return; }
+            keys.sort((a,b) => (m[b].lastSeen||0)-(m[a].lastSeen||0));
+            imgList.innerHTML = '';
+            keys.forEach(k => {
+                const entry = m[k], name = k.split('/').pop().substring(0,22);
+                const row = document.createElement('div'); row.className = 'layma-img-row-v2';
+                const meta = document.createElement('div');
+                meta.style.cssText = 'display:flex;justify-content:space-between;margin-bottom:2px';
+                meta.innerHTML = `<span style="color:#444;font-size:7.5px;font-family:Share Tech Mono,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:80%">${name}</span><span style="color:#333;font-size:7px;font-family:Share Tech Mono,monospace">${entry.count||1}x</span>`;
+                row.appendChild(meta);
+                const inp = document.createElement('input'); inp.type='text'; inp.className='layma-img-url-v2'; inp.value=entry.url||''; inp.placeholder='URL...';
+                row.appendChild(inp);
+                const bRow = document.createElement('div'); bRow.className='layma-img-btn-row-v2';
+                const bUse=document.createElement('button'); bUse.className='layma-img-btn-v2'; bUse.textContent='Use';
+                const bSave=document.createElement('button'); bSave.className='layma-img-btn-v2'; bSave.textContent='Save';
+                const bDel=document.createElement('button'); bDel.className='layma-img-btn-del-v2 layma-img-btn-v2'; bDel.textContent='X';
+                bUse.onclick = () => { urlBox.value=inp.value; window._laymaUI.selectedImgKey=k; };
+                bSave.onclick = () => { const mm=getImgMap(); if(mm[k]) { mm[k].url=inp.value.trim(); mm[k].lastSeen=Date.now(); saveImgMap(mm); } };
+                bDel.onclick = () => { const mm=getImgMap(); delete mm[k]; saveImgMap(mm); if(window._laymaUI.selectedImgKey===k) window._laymaUI.selectedImgKey=null; row.remove(); };
+                bRow.append(bUse,bSave,bDel); row.appendChild(bRow); imgList.appendChild(row);
+            });
+            const clr=document.createElement('button'); clr.className='layma-clr-btn-v2'; clr.textContent='DELETE ALL';
+            clr.onclick = () => { saveImgMap({}); window._laymaUI.selectedImgKey=null; imgList.innerHTML='<div style="color:#444;font-size:9px;text-align:center;padding:6px">Deleted all</div>'; };
+            imgList.appendChild(clr);
+        }
+
+        shell.querySelector('#layma-btn-scan-v2').onclick = async () => {
+            imgList.style.display='none'; shell.querySelector('#layma-cand-v2').style.display='none'; cacheBadge.style.display='none';
+            setStatus('Starting AI Scan...',''); await runAIScan(setStatus, urlBox);
+        };
+
+        shell.querySelector('#layma-btn-open-v2').onclick = () => {
+            let url = urlBox.value.trim();
+            if (!url) { setStatus('Enter URL first!','err'); return; }
+            if (!url.startsWith('http')) url = 'https://'+url;
+            let saved = false;
+            if (window._laymaUI.selectedImgKey) {
+                const mm=getImgMap(), key=window._laymaUI.selectedImgKey;
+                if (mm[key] && mm[key].url !== url) { mm[key].url=url; mm[key].lastSeen=Date.now(); saveImgMap(mm); if(imgList.style.display==='block') renderImgList(); saved=true; }
+            } else if (window._laymaUI.lastScannedImgKey && window._laymaUI.lastScannedImgSrc) {
+                const mm=getImgMap(), key=window._laymaUI.lastScannedImgKey;
+                if (!mm[key] || mm[key].url !== url) { saveImgURL(window._laymaUI.lastScannedImgSrc, url, 1); window._laymaUI.selectedImgKey=key; saved=true; }
+            }
+            setStatus(saved ? 'Saved & opening...' : 'Opening...','ok');
+            addURL(url); openViaFacebook(url);
+            autoBar.style.display='block'; autoBar.textContent='Waiting for code from target tab...';
+        };
+
+        shell.querySelector('#layma-btn-export-v2').onclick = () => { try { exportData(); setStatus('Exported!','ok'); } catch(e) { setStatus('Export error: '+e.message,'err'); } };
+        shell.querySelector('#layma-btn-import-v2').onclick = () => { importFile.value=''; importFile.click(); };
+        importFile.onchange = () => {
+            const file=importFile.files[0]; if(!file) return;
+            setStatus('Importing...','');
+            importData(file, (msg, type) => { setStatus(msg,type); if(imgList.style.display==='block') renderImgList(); });
+        };
+
+        startCodeListener(setStatus, autoBar);
+        startLaymaCaptchaWatcher(setStatus, autoBar);
+        startCountdownWatcher();
+
+        setTimeout(async () => {
+            const ui = window._laymaUI; if (!ui) return;
+            for (const img of document.images) {
+                const cached = lookupImgURL(img.src);
+                if (cached) {
+                    ui.urlBox.value=cached; ui.selectedImgKey=normKey(img.src);
+                    ui.lastScannedImgKey=normKey(img.src); ui.lastScannedImgSrc=img.src;
+                    cacheBadge.style.display='block'; setStatus('Cache hit: '+cached,'ok');
+                    openViaFacebook(cached); autoBar.style.display='block';
+                    autoBar.textContent='Waiting for code from target tab...'; return;
+                }
+            }
+            await runAIScan(setStatus, ui.urlBox);
+        }, 2500);
+    }
+
+    // ─── ENTRY POINT ──────────────────────────────────────────────────────
+    if (isOnLayma) {
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', createUI);
+        else createUI();
+
+    } else if (isOpenedByScript) {
+        preventThrottling();
+        // Mini menu chỉ hiện ở trang đích (không phải layma.net)
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', createMiniMenu);
+        else createMiniMenu();
+
+        const runFlow = () => {
+            const isReload = sessionStorage.getItem('layma_reload_flow');
+            if (isReload) {
+                sessionStorage.removeItem('layma_reload_flow');
+                waitForPageLoad().then(() => { setTimeout(handleReloadedTargetSite, 1500); });
+            } else {
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', () => { clickOnTargetSite(); });
+                } else {
+                    clickOnTargetSite();
+                }
+            }
+        };
+        runFlow();
+    }
+
+})();
